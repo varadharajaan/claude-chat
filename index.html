@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Chat</title>
+  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
+</head>
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <svg class="logo-icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span class="logo-text">Claude Chat</span>
+      </div>
+      <button class="new-chat-btn" id="newChatBtn" title="New chat">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="sidebar-conversations" id="conversationList">
+      <!-- Conversations populated by JS -->
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="settings-row">
+        <button class="theme-toggle" id="themeToggle" title="Toggle theme">
+          <svg class="sun-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <svg class="moon-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+          <span class="theme-label">Theme</span>
+        </button>
+        <div class="proxy-config">
+          <label class="proxy-label" for="proxyUrl">Proxy</label>
+          <div class="proxy-input-wrapper">
+            <input type="text" class="proxy-input" id="proxyUrl" value="http://localhost:5000" placeholder="http://localhost:5000">
+            <span class="proxy-status-dot" id="proxyStatusDot" title="Checking..."></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Sidebar overlay for mobile -->
+  <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+  <!-- Main chat area -->
+  <main class="main" id="main">
+    <!-- Top bar -->
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="3" y1="6" x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+      <div class="model-selector-wrapper">
+        <select class="model-selector" id="modelSelector">
+          <option value="">Loading models...</option>
+        </select>
+      </div>
+      <div class="topbar-spacer"></div>
+      <button class="log-toggle-btn" id="logToggleBtn" title="Toggle server logs">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="16" y1="13" x2="8" y2="13"/>
+          <line x1="16" y1="17" x2="8" y2="17"/>
+          <polyline points="10 9 9 9 8 9"/>
+        </svg>
+        <span>Logs</span>
+        <span class="log-error-badge hidden" id="logErrorBadge">0</span>
+      </button>
+    </header>
+
+    <!-- Log Panel (drawer from right) -->
+    <div class="log-panel hidden" id="logPanel">
+      <div class="log-panel-header">
+        <h3 class="log-panel-title">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <select class="log-source-selector" id="logSourceSelector">
+            <option value="proxy">LiteLLM Proxy Logs</option>
+            <option value="chat">Chat Server Logs</option>
+          </select>
+        </h3>
+        <div class="log-panel-controls">
+          <select class="log-level-filter" id="logLevelFilter">
+            <option value="all">All levels</option>
+            <option value="error">Errors only</option>
+            <option value="warn">Warnings+</option>
+          </select>
+          <input type="text" class="log-search" id="logSearch" placeholder="Filter logs...">
+          <label class="log-autoscroll-label" title="Auto-scroll to bottom">
+            <input type="checkbox" id="logAutoScroll" checked>
+            Auto
+          </label>
+          <button class="log-action-btn" id="logPopoutBtn" title="Open logs in separate tab">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              <polyline points="15 3 21 3 21 9"/>
+              <line x1="10" y1="14" x2="21" y2="3"/>
+            </svg>
+          </button>
+          <button class="log-action-btn" id="logRefreshBtn" title="Refresh logs">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button class="log-action-btn" id="logClearBtn" title="Clear log file">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+          </button>
+          <button class="log-action-btn" id="logCloseBtn" title="Close logs">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div class="log-panel-info" id="logPanelInfo">
+        <span id="logFileInfo">Loading...</span>
+      </div>
+      <div class="log-panel-body" id="logPanelBody">
+        <div class="log-empty">No logs loaded. Click refresh or open the panel to start tailing.</div>
+      </div>
+    </div>
+
+    <!-- Chat messages -->
+    <div class="chat-container" id="chatContainer">
+      <div class="chat-messages" id="chatMessages">
+        <!-- Welcome screen shown when no messages -->
+        <div class="welcome" id="welcomeScreen">
+          <div class="welcome-icon">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </div>
+          <h1 class="welcome-title">What can I help you with?</h1>
+          <p class="welcome-subtitle">Chat with Claude, GPT, Gemini and more through your local proxy.</p>
+          <div class="welcome-suggestions">
+            <button class="suggestion-chip" data-prompt="Explain quantum computing in simple terms">Explain quantum computing</button>
+            <button class="suggestion-chip" data-prompt="Write a Python function to find prime numbers">Write a prime number function</button>
+            <button class="suggestion-chip" data-prompt="What are the best practices for REST API design?">REST API best practices</button>
+            <button class="suggestion-chip" data-prompt="Help me debug my code">Help me debug code</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input area -->
+    <div class="input-area">
+      <div class="input-container">
+        <div class="image-preview-area hidden" id="imagePreviewArea">
+          <!-- Pasted images will appear here as thumbnails -->
+        </div>
+        <div class="input-row">
+          <textarea
+            class="chat-input"
+            id="chatInput"
+            placeholder="Message Claude... (paste images with Ctrl+V)"
+            rows="1"
+            autofocus
+          ></textarea>
+          <button class="send-btn" id="sendBtn" title="Send message" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            </svg>
+          </button>
+          <button class="stop-btn hidden" id="stopBtn" title="Stop generating">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <p class="input-hint">
+        <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images
+      </p>
+    </div>
+  </main>
+
+  <!-- Rename dialog -->
+  <div class="dialog-overlay hidden" id="renameDialog">
+    <div class="dialog">
+      <h3 class="dialog-title">Rename conversation</h3>
+      <input type="text" class="dialog-input" id="renameInput" placeholder="Conversation name">
+      <div class="dialog-actions">
+        <button class="dialog-btn dialog-btn-cancel" id="renameCancelBtn">Cancel</button>
+        <button class="dialog-btn dialog-btn-confirm" id="renameConfirmBtn">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirmation dialog -->
+  <div class="dialog-overlay hidden" id="deleteDialog">
+    <div class="dialog">
+      <h3 class="dialog-title">Delete conversation?</h3>
+      <p class="dialog-text">This action cannot be undone.</p>
+      <div class="dialog-actions">
+        <button class="dialog-btn dialog-btn-cancel" id="deleteCancelBtn">Cancel</button>
+        <button class="dialog-btn dialog-btn-danger" id="deleteConfirmBtn">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=6"></script>
+</body>
+</html>
