@@ -31,7 +31,16 @@ CHAT_PORT = int(os.environ.get("CHAT_PORT", 8090))
 CHAT_SCRIPT = CHAT_DIR / "server.py"
 CHAT_LOG = CHAT_DIR / "data" / "chat-server.log"
 
-PROXY_DIR = Path(os.environ.get("LITELLM_PROXY_DIR", Path.home() / ".mai-llmproxy"))
+PROXY_DIR = Path(os.environ.get("LITELLM_PROXY_DIR", ""))
+if not PROXY_DIR.name:
+    # Auto-detect: check common proxy directory names
+    for _name in (".litellm-proxy", ".mai-llmproxy"):
+        _candidate = Path.home() / _name
+        if _candidate.exists():
+            PROXY_DIR = _candidate
+            break
+    else:
+        PROXY_DIR = Path.home() / ".litellm-proxy"  # default for new setups
 PROXY_VENV = PROXY_DIR / "venv"
 PROXY_PORT = int(os.environ.get("LITELLM_PROXY_PORT", 5000))
 PROXY_CONFIG = PROXY_DIR / "litellm_config.yaml"
@@ -130,6 +139,17 @@ def human_size(size_bytes):
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
+
+
+def fmt_elapsed(seconds):
+    """Format elapsed time as a human-readable string."""
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    elif seconds < 60:
+        return f"{seconds:.1f}s"
+    else:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {s:.1f}s"
 
 
 def wait_for_port(port, timeout=10, interval=0.5):
@@ -255,6 +275,7 @@ def start_chat():
         print(f"  {C.RED}[chat]{C.RESET}  server.py not found at {CHAT_SCRIPT}")
         return False
 
+    t0 = time.time()
     print(f"  {C.GREEN}[chat]{C.RESET}  Starting chat server on port {CHAT_PORT}...")
 
     # Ensure data dir exists for logs
@@ -281,12 +302,14 @@ def start_chat():
         )
 
     if wait_for_port(CHAT_PORT, timeout=5):
+        elapsed = time.time() - t0
         pid = find_pid_on_port(CHAT_PORT)
-        print(f"  {C.GREEN}[chat]{C.RESET}  Started {C.DIM}(PID: {pid}){C.RESET}")
+        print(f"  {C.GREEN}[chat]{C.RESET}  Started {C.DIM}(PID: {pid}) [{fmt_elapsed(elapsed)}]{C.RESET}")
         print(f"         {C.DIM}http://localhost:{CHAT_PORT}{C.RESET}")
         return True
     else:
-        print(f"  {C.RED}[chat]{C.RESET}  Failed to start — check for errors")
+        elapsed = time.time() - t0
+        print(f"  {C.RED}[chat]{C.RESET}  Failed to start — check for errors {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return False
 
 
@@ -310,6 +333,7 @@ def start_proxy():
     # Rotate proxy log before starting if it's too large
     maintain_logs()
 
+    t0 = time.time()
     print(f"  {C.GREEN}[proxy]{C.RESET} Starting LiteLLM proxy on port {PROXY_PORT}...")
 
     # Build the command using the venv's python to run litellm module
@@ -319,18 +343,18 @@ def start_proxy():
         "--port", str(PROXY_PORT),
     ]
 
-    # Build environment — replicate what the VS Code MAI extension sets
+    # Build environment — replicate what the LiteLLM proxy extension sets
     proxy_env = os.environ.copy()
     proxy_env["PYTHONPATH"] = str(PROXY_DIR)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
-    # GitHub Copilot auth tokens — managed by the VS Code MAI extension
+    # GitHub Copilot auth tokens — managed by the LiteLLM proxy extension
     copilot_token_dir = Path.home() / ".config" / "litellm" / "github_copilot"
     if copilot_token_dir.exists():
         proxy_env["GITHUB_COPILOT_TOKEN_DIR"] = str(copilot_token_dir)
     else:
         print(f"  {C.YELLOW}[proxy]{C.RESET} Warning: GitHub Copilot token dir not found")
         print(f"         {C.DIM}{copilot_token_dir}{C.RESET}")
-        print(f"         {C.DIM}Run 'MAI-LLmProxy: Start Server' in VS Code first to authenticate{C.RESET}")
+        print(f"         {C.DIM}Start the LiteLLM proxy via VS Code or CLI first to authenticate{C.RESET}")
 
     # Open log file for output
     log_handle = open(PROXY_LOG, "a", encoding="utf-8")
@@ -358,12 +382,14 @@ def start_proxy():
 
     print(f"         {C.DIM}Waiting for proxy to initialize...{C.RESET}")
     if wait_for_port(PROXY_PORT, timeout=30):
+        elapsed = time.time() - t0
         pid = find_pid_on_port(PROXY_PORT)
-        print(f"  {C.GREEN}[proxy]{C.RESET} Started {C.DIM}(PID: {pid}){C.RESET}")
+        print(f"  {C.GREEN}[proxy]{C.RESET} Started {C.DIM}(PID: {pid}) [{fmt_elapsed(elapsed)}]{C.RESET}")
         print(f"         {C.DIM}http://localhost:{PROXY_PORT}{C.RESET}")
         return True
     else:
-        print(f"  {C.YELLOW}[proxy]{C.RESET} Still initializing... use {C.BOLD}devctl status{C.RESET} to check")
+        elapsed = time.time() - t0
+        print(f"  {C.YELLOW}[proxy]{C.RESET} Still initializing... use {C.BOLD}devctl status{C.RESET} to check {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return False
 
 
@@ -376,14 +402,17 @@ def stop_chat():
         print(f"  {C.DIM}[chat]{C.RESET}  Not running")
         return True
 
+    t0 = time.time()
     print(f"  {C.RED}[chat]{C.RESET}  Stopping {C.DIM}(PID: {pid}){C.RESET}...")
     kill_pid(pid)
 
     if wait_for_port_closed(CHAT_PORT):
-        print(f"  {C.GREEN}[chat]{C.RESET}  Stopped")
+        elapsed = time.time() - t0
+        print(f"  {C.GREEN}[chat]{C.RESET}  Stopped {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return True
     else:
-        print(f"  {C.RED}[chat]{C.RESET}  Failed to stop — try: taskkill /PID {pid} /F")
+        elapsed = time.time() - t0
+        print(f"  {C.RED}[chat]{C.RESET}  Failed to stop — try: taskkill /PID {pid} /F {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return False
 
 
@@ -394,14 +423,17 @@ def stop_proxy():
         print(f"  {C.DIM}[proxy]{C.RESET} Not running")
         return True
 
+    t0 = time.time()
     print(f"  {C.RED}[proxy]{C.RESET} Stopping {C.DIM}(PID: {pid}){C.RESET}...")
     kill_pid(pid)
 
     if wait_for_port_closed(PROXY_PORT):
-        print(f"  {C.GREEN}[proxy]{C.RESET} Stopped")
+        elapsed = time.time() - t0
+        print(f"  {C.GREEN}[proxy]{C.RESET} Stopped {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return True
     else:
-        print(f"  {C.RED}[proxy]{C.RESET} Failed to stop — try: taskkill /PID {pid} /F")
+        elapsed = time.time() - t0
+        print(f"  {C.RED}[proxy]{C.RESET} Failed to stop — try: taskkill /PID {pid} /F {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return False
 
 
@@ -878,6 +910,8 @@ def main():
 
     print()
 
+    t_total = time.time()
+
     if action == "start":
         if target in ("proxy", "all"):
             start_proxy()
@@ -907,7 +941,10 @@ def main():
     else:
         print(f"  {C.RED}Unknown action:{C.RESET} {action}")
         show_help()
+        return
 
+    total_elapsed = time.time() - t_total
+    print(f"  {C.DIM}Total: {fmt_elapsed(total_elapsed)}{C.RESET}")
     print()
 
 

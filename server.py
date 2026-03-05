@@ -29,8 +29,18 @@ DATA_DIR = Path(__file__).parent / "data"
 CHAT_LOG_FILE = DATA_DIR / "chat-server.log"
 
 # LiteLLM proxy log — override with LITELLM_LOG env var if your proxy lives elsewhere
-_DEFAULT_PROXY_DIR = Path.home() / ".mai-llmproxy"
-LITELLM_LOG_FILE = Path(os.environ.get("LITELLM_LOG", _DEFAULT_PROXY_DIR / "litellm.log"))
+_PROXY_DIR_OVERRIDE = os.environ.get("LITELLM_LOG")
+if _PROXY_DIR_OVERRIDE:
+    LITELLM_LOG_FILE = Path(_PROXY_DIR_OVERRIDE)
+else:
+    # Auto-detect: check common proxy directory names
+    _DEFAULT_PROXY_DIR = Path.home() / ".litellm-proxy"
+    for _name in (".litellm-proxy", ".mai-llmproxy"):
+        _candidate = Path.home() / _name
+        if _candidate.exists():
+            _DEFAULT_PROXY_DIR = _candidate
+            break
+    LITELLM_LOG_FILE = _DEFAULT_PROXY_DIR / "litellm.log"
 HISTORY_DIR = DATA_DIR / "conversations"
 BACKUP_DIR = DATA_DIR / "backups"
 

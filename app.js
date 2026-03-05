@@ -13,6 +13,7 @@
   const MODEL_KEY = 'claude-chat-model';
   const PROXY_KEY = 'claude-chat-proxy';
   const LOG_POLL_INTERVAL = 3000; // ms
+  const LOG_WIDTH_KEY = 'claude-chat-log-width';
 
   // ─── State ────────────────────────────────────────
   let state = {
@@ -64,6 +65,7 @@
   const logCloseBtn = $('#logCloseBtn');
   const logPanelBody = $('#logPanelBody');
   const logFileInfo = $('#logFileInfo');
+  const logResizeHandle = $('#logResizeHandle');
 
   // Proxy health refs
   const proxyStatusDot = $('#proxyStatusDot');
@@ -93,7 +95,6 @@
   }
 
   // Auto-generate a friendly label from a model ID
-  // Labels match what GitHub Copilot CLI shows
   function getModelLabel(id) {
     // Strip date suffixes like -20251001 for display purposes
     const cleanId = id.replace(/-\d{8}$/, '');
@@ -165,14 +166,14 @@
 
   /**
    * Normalize a model identifier for comparison.
-   * Strips provider prefixes (github_copilot/), lowercases, removes date suffixes,
+   * Strips provider prefixes, lowercases, removes date suffixes,
    * and normalizes separators so "claude-opus-4-6" ≈ "claude-opus-4.6".
    */
   function normalizeModelId(id) {
     if (!id) return '';
     return id
       .toLowerCase()
-      .replace(/^github_copilot\//i, '')        // strip provider prefix
+      .replace(/^[a-z_]+\//i, '')                 // strip provider prefix (e.g. "provider/model")
       .replace(/-\d{8}$/, '')                    // strip date suffix (e.g., -20250929)
       .replace(/\./g, '-')                       // dots → dashes (4.6 → 4-6)
       .replace(/\s+/g, '-')                      // spaces → dashes
@@ -212,9 +213,9 @@
   }
 
   function prettifyBackendModel(backendModel) {
-    // "github_copilot/claude-opus-4.6-1m" → "claude-opus-4.6-1m"
-    // "github_copilot/Claude Sonnet 4.5"  → "Claude Sonnet 4.5"
-    return backendModel.replace(/^github_copilot\//i, '');
+    // Strip any "provider/" prefix → just the model name
+    // e.g. "provider/claude-opus-4.6-1m" → "claude-opus-4.6-1m"
+    return backendModel.replace(/^[a-z_]+\//i, '');
   }
 
   // Load dead models from localStorage
@@ -257,6 +258,9 @@
 
     // Check proxy health on startup (non-blocking, no toast on first load)
     checkProxyHealth(true);
+
+    // Initialize log panel resize handle
+    initLogResize();
 
     // Server-side persistence: restore from server if localStorage is empty,
     // otherwise push local data to server in background
@@ -551,9 +555,9 @@
       // These are also subject to dead-model filtering — if a virtual model returns 400
       // "not supported", it gets marked dead and won't appear for 1 hour.
       const virtualModels = [
-        'claude-opus-4-6-1m',     // routes to github_copilot/claude-opus-4.6-1m
-        'claude-sonnet-4-6-1m',   // routes to github_copilot/Claude Sonnet 4.6
-        'claude-sonnet-4-5',      // routes to github_copilot/Claude Sonnet 4.5
+        'claude-opus-4-6-1m',     // 1M context variant
+        'claude-sonnet-4-6-1m',   // 1M context variant
+        'claude-sonnet-4-5',      // version alias
       ];
       const modelsSetPre = new Set(state.models);
       virtualModels.forEach(vm => {
@@ -1067,10 +1071,7 @@
             // ─── Fallback detection (first chunk only) ───
             if (!fallbackChecked && parsed.model) {
               fallbackChecked = true;
-              console.log('[Fallback] requested:', model, '| actual:', parsed.model,
-                '| reqNorm:', normalizeModelId(model), '| actNorm:', normalizeModelId(parsed.model));
               const fb = detectFallback(model, parsed.model);
-              console.log('[Fallback] result:', fb);
               if (fb.isFallback) {
                 showFallbackNotice(assistantDiv, model, fb.requestedLabel, fb.actualLabel);
               }
@@ -1236,9 +1237,15 @@
   function toggleLogPanel() {
     state.logPanelOpen = !state.logPanelOpen;
     logPanel.classList.toggle('hidden', !state.logPanelOpen);
+    logResizeHandle.classList.toggle('hidden', !state.logPanelOpen);
     logToggleBtn.classList.toggle('active', state.logPanelOpen);
 
     if (state.logPanelOpen) {
+      // Restore saved width
+      const savedWidth = localStorage.getItem(LOG_WIDTH_KEY);
+      if (savedWidth) {
+        logPanel.style.width = savedWidth + 'px';
+      }
       fetchLogs();
       startLogPolling();
     } else {
@@ -1249,8 +1256,53 @@
   function closeLogPanel() {
     state.logPanelOpen = false;
     logPanel.classList.add('hidden');
+    logResizeHandle.classList.add('hidden');
     logToggleBtn.classList.remove('active');
     stopLogPolling();
+  }
+
+  // ─── Log panel resize (drag handle) ────────────────
+  function initLogResize() {
+    const MIN_WIDTH = 280;
+    const MAX_RATIO = 0.7; // max 70% of viewport width
+    let isDragging = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    logResizeHandle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      isDragging = true;
+      startX = e.clientX;
+      startWidth = logPanel.offsetWidth;
+      logResizeHandle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      // Dragging left → panel grows; dragging right → panel shrinks
+      const delta = startX - e.clientX;
+      const maxWidth = window.innerWidth * MAX_RATIO;
+      const newWidth = Math.min(maxWidth, Math.max(MIN_WIDTH, startWidth + delta));
+      logPanel.style.width = newWidth + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!isDragging) return;
+      isDragging = false;
+      logResizeHandle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      // Persist width
+      localStorage.setItem(LOG_WIDTH_KEY, logPanel.offsetWidth);
+    });
+
+    // Double-click to reset to default 480px
+    logResizeHandle.addEventListener('dblclick', () => {
+      logPanel.style.width = '480px';
+      localStorage.removeItem(LOG_WIDTH_KEY);
+    });
   }
 
   function popoutLogs() {

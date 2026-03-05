@@ -354,6 +354,23 @@ body {
   min-width: 0;
 }
 
+/* Content area wraps chat + log panel side by side */
+.main-content-area {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Chat column takes remaining space */
+.chat-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
 /* Top bar */
 .topbar {
   display: flex;
@@ -1181,14 +1198,44 @@ kbd {
   line-height: 1.4;
 }
 
+/* --- Log panel resize handle --- */
+.log-resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 51;
+  transition: background 0.15s;
+}
+.log-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 40px;
+  border-radius: 3px;
+  background: var(--border);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.log-resize-handle:hover,
+.log-resize-handle.dragging {
+  background: var(--accent-subtle);
+}
+.log-resize-handle:hover::after,
+.log-resize-handle.dragging::after {
+  opacity: 1;
+  background: var(--accent);
+}
+
 /* --- Log panel --- */
 .log-panel {
-  position: absolute;
-  top: 52px;
-  right: 0;
-  bottom: 0;
   width: 480px;
-  max-width: 100%;
+  min-width: 280px;
+  max-width: 70vw;
   background: var(--sidebar-bg);
   border-left: 1px solid var(--border);
   display: flex;
@@ -1408,11 +1455,6 @@ kbd {
   padding-top: 4px;
 }
 
-/* --- Main with log panel open --- */
-.main {
-  position: relative;
-}
-
 /* --- Streaming cursor --- */
 .streaming-cursor::after {
   content: '▋';
@@ -1428,7 +1470,16 @@ kbd {
 
 @media (max-width: 768px) {
   .log-panel {
-    width: 100%;
+    /* On mobile, log panel takes full width and overlays the chat */
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100% !important;
+    min-width: 0;
+  }
+  .log-resize-handle {
+    display: none !important;
   }
   .log-toggle-btn span:not(.log-error-badge) {
     display: none;
