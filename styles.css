@@ -195,6 +195,31 @@ body {
   color: var(--text);
 }
 
+/* Title + project badge stacked block */
+.conv-title-block {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+/* Project badge shown on conversations in "All Chats" view */
+.conv-project-badge {
+  font-size: 0.68rem;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  display: inline-block;
+  line-height: 1.5;
+}
+
 .conversation-actions {
   display: none;
   gap: 2px;
@@ -433,6 +458,62 @@ body {
   position: relative;
 }
 
+/* ─── Effort selector ─────────────────────────────── */
+.effort-selector-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+}
+
+/* The label updates dynamically to show current level: "Low" / "Med" / "High"
+   like the CLI's "▪▪▪ High" indicator */
+.effort-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  user-select: none;
+  min-width: 2.8rem;
+  text-align: right;
+}
+
+.effort-btn-group {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.effort-btn {
+  background: var(--input-bg);
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-family: inherit;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.effort-btn:last-child {
+  border-right: none;
+}
+
+.effort-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text);
+}
+
+.effort-btn.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+/* ──────────────────────────────────────────────────── */
+
 .model-selector {
   appearance: none;
   -webkit-appearance: none;
@@ -463,7 +544,46 @@ body {
   flex: 1;
 }
 
-/* --- Chat container --- */
+/* ─── Active project badge in topbar ─────────────── */
+.active-project-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--accent-subtle);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+.active-project-badge:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.active-project-badge svg {
+  flex-shrink: 0;
+}
+.active-project-badge.hidden {
+  display: none;
+}
+
+/* Move-to-project dialog subtitle */
+.dialog-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: -8px 0 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* ──────────────────────────────────────────────────── */
 .chat-container {
   flex: 1;
   overflow-y: auto;
@@ -2050,6 +2170,15 @@ kbd {
   color: var(--text-secondary);
 }
 
+/* Reasoning/thinking token row — highlighted when thinking was active */
+.token-pill-row.token-pill-reasoning {
+  color: var(--accent);
+  font-weight: 600;
+}
+.token-pill-row.token-pill-reasoning span:first-child {
+  color: var(--accent);
+}
+
 /* --- Live streaming token counter --- */
 .streaming-tokens {
   display: inline-flex;
@@ -2091,6 +2220,13 @@ kbd {
 .input-hint .token-stats {
   display: inline;
   margin-left: 4px;
+}
+
+/* Session cost badge in input hint */
+.session-cost {
+  color: var(--accent);
+  font-weight: 500;
+  cursor: default;
 }
 
 /* =====================================================

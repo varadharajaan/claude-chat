@@ -105,6 +105,20 @@
           <option value="">Loading models...</option>
         </select>
       </div>
+      <div class="effort-selector-wrapper" title="Thinking effort — like Claude Code's /model effort setting">
+        <span class="effort-label">High</span>
+        <div class="effort-btn-group">
+          <button class="effort-btn" data-effort="low"    title="Low">Low</button>
+          <button class="effort-btn" data-effort="medium" title="Medium">Med</button>
+          <button class="effort-btn active" data-effort="high" title="High">High</button>
+        </div>
+      </div>
+      <div id="activeProjectBadge" class="active-project-badge hidden" title="Active project — click to edit">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span id="activeProjectName"></span>
+      </div>
       <div class="topbar-spacer"></div>
       <!-- Export button -->
       <button class="topbar-action-btn" id="exportBtn" title="Export conversation as Markdown">
@@ -275,6 +289,21 @@
       <div class="dialog-actions">
         <button class="dialog-btn dialog-btn-cancel" id="deleteCancelBtn">Cancel</button>
         <button class="dialog-btn dialog-btn-danger" id="deleteConfirmBtn">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Move to project dialog -->
+  <div class="dialog-overlay hidden" id="moveProjectDialog">
+    <div class="dialog">
+      <h3 class="dialog-title">Move to Project</h3>
+      <p class="dialog-subtitle" id="moveProjectConvTitle"></p>
+      <select class="dialog-input" id="moveProjectSelect">
+        <option value="">— No Project (All Chats) —</option>
+      </select>
+      <div class="dialog-actions">
+        <button class="dialog-btn dialog-btn-cancel" id="moveProjectCancelBtn">Cancel</button>
+        <button class="dialog-btn dialog-btn-confirm" id="moveProjectConfirmBtn">Move</button>
       </div>
     </div>
   </div>

@@ -12,8 +12,13 @@
   const STORAGE_KEY = 'claude-chat-data';
   const THEME_KEY = 'claude-chat-theme';
   const MODEL_KEY = 'claude-chat-model';
+  const EFFORT_KEY = 'claude-chat-effort';
   const PROXY_KEY = 'claude-chat-proxy';
   const PROJECT_KEY = 'claude-chat-active-project';
+
+  // ─── Effort level ─────────────────────────────────
+  // Mirrors Claude Code CLI's /model effort slider (low / medium / high).
+  // Sent as reasoning_effort on every Claude request.
   const LOG_POLL_INTERVAL = 3000; // ms
   const LOG_WIDTH_KEY = 'claude-chat-log-width';
 
@@ -138,6 +143,7 @@
     activeConversationId: null,
     models: [],
     selectedModel: '',
+    selectedEffort: 'high',  // low | medium | high  (mirrors CLI /model effort)
     isStreaming: false,
     abortController: null,
     logPanelOpen: false,
@@ -149,6 +155,9 @@
     // Phase 2: Token stats
     conversationTokens: 0,
     conversationCost: 0,
+    // Session-wide cost tracking (resets on page reload)
+    sessionCost: 0,
+    sessionMessages: 0,
   };
 
   // ─── DOM refs ─────────────────────────────────────
@@ -202,6 +211,16 @@
   const projectNameInput = $('#projectNameInput');
   const projectDescInput = $('#projectDescInput');
   const projectSystemPrompt = $('#projectSystemPrompt');
+  // Active project topbar badge
+  const activeProjectBadge = $('#activeProjectBadge');
+  const activeProjectName  = $('#activeProjectName');
+  // Move-to-project dialog
+  const moveProjectDialog      = $('#moveProjectDialog');
+  const moveProjectConvTitle   = $('#moveProjectConvTitle');
+  const moveProjectSelect      = $('#moveProjectSelect');
+  const moveProjectCancelBtn   = $('#moveProjectCancelBtn');
+  const moveProjectConfirmBtn  = $('#moveProjectConfirmBtn');
+  let moveProjectTargetConvId  = null;
   const knowledgeFilesArea = $('#knowledgeFilesArea');
   const knowledgeAddBtn = $('#knowledgeAddBtn');
   const projectSaveBtn = $('#projectSaveBtn');
@@ -421,6 +440,8 @@
     }
     const savedModel = localStorage.getItem(MODEL_KEY);
     if (savedModel) state.selectedModel = savedModel;
+    const savedEffort = localStorage.getItem(EFFORT_KEY);
+    if (savedEffort && ['low','medium','high'].includes(savedEffort)) state.selectedEffort = savedEffort;
     const savedProject = localStorage.getItem(PROJECT_KEY);
     if (savedProject) state.activeProjectId = savedProject;
   }
@@ -813,9 +834,25 @@
       const opt = document.createElement('option');
       opt.value = proj.id;
       opt.textContent = proj.name || 'Untitled Project';
+      if (proj.description) opt.title = proj.description;
       projectSelect.appendChild(opt);
     });
     projectSelect.value = currentVal;
+    updateActiveProjectBadge();
+  }
+
+  // ─── Topbar active-project badge ──────────────────
+  function updateActiveProjectBadge() {
+    if (!activeProjectBadge || !activeProjectName) return;
+    const proj = state.activeProjectId ? state.projects[state.activeProjectId] : null;
+    if (proj) {
+      activeProjectName.textContent = proj.name || 'Untitled Project';
+      if (proj.description) activeProjectBadge.title = proj.description;
+      else activeProjectBadge.title = 'Active project — click to edit';
+      activeProjectBadge.classList.remove('hidden');
+    } else {
+      activeProjectBadge.classList.add('hidden');
+    }
   }
 
   function switchProject(projectId) {
@@ -840,6 +877,7 @@
       }
     }
     updateContextBar();
+    updateActiveProjectBadge();
   }
 
   function showProjectDialog(projectId) {
@@ -1125,6 +1163,7 @@
           projectSelect.value = projId;
           renderConversationList();
         }
+        updateActiveProjectBadge();
         hideProjectDialog();
         showToast(`Project "${name}" saved.`, 'success');
       } else {
@@ -1258,6 +1297,25 @@
     }
   }
 
+  function duplicateConversation(id) {
+    const original = state.conversations[id];
+    if (!original) return;
+
+    const now = Date.now();
+    const newId = `conv_${now}_${Math.random().toString(36).slice(2, 8)}`;
+    const clone = JSON.parse(JSON.stringify(original));
+    clone.id = newId;
+    clone.title = `${original.title} (copy)`;
+    clone.createdAt = now;
+    clone.updatedAt = now;
+
+    state.conversations[newId] = clone;
+    saveState();
+    syncConversationToServer(clone);
+    switchConversation(newId);
+    showToast('Conversation duplicated.', 'success');
+  }
+
   function autoTitle(convId, userMessage) {
     const conv = state.conversations[convId];
     if (!conv || conv.title !== 'New chat') return;
@@ -1316,18 +1374,38 @@
 
       const div = document.createElement('div');
       div.className = 'conversation-item' + (conv.id === state.activeConversationId ? ' active' : '');
+
+      // Project badge — only show when viewing "All Chats" (no active project filter)
+      const projBadge = (!state.activeProjectId && conv.projectId && state.projects[conv.projectId])
+        ? `<span class="conv-project-badge" title="${escapeHtml(state.projects[conv.projectId].name || 'Project')}">${escapeHtml(state.projects[conv.projectId].name || 'Project')}</span>`
+        : '';
+
       div.innerHTML = `
         <button class="conv-star-btn${conv.starred ? ' active' : ''}" title="${conv.starred ? 'Unstar' : 'Star'}">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="${conv.starred ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
             <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
           </svg>
         </button>
-        <span class="conversation-title">${escapeHtml(conv.title)}</span>
+        <div class="conv-title-block">
+          <span class="conversation-title">${escapeHtml(conv.title)}</span>
+          ${projBadge}
+        </div>
         <div class="conversation-actions">
+          <button class="conv-action-btn move-project-btn" title="Move to project" data-id="${conv.id}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
           <button class="conv-action-btn rename-btn" title="Rename" data-id="${conv.id}">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+          <button class="conv-action-btn duplicate-btn" title="Duplicate" data-id="${conv.id}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="8" y="8" width="14" height="14" rx="2"/>
+              <path d="M4 16H2V4a2 2 0 0 1 2-2h12v2"/>
             </svg>
           </button>
           <button class="conv-action-btn danger delete-btn" title="Delete" data-id="${conv.id}">
@@ -1350,13 +1428,63 @@
         syncConversationToServer(conv);
         renderConversationList();
       });
+      div.querySelector('.move-project-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        showMoveProjectDialog(conv.id);
+      });
       div.querySelector('.rename-btn').addEventListener('click', () => showRenameDialog(conv.id));
+      div.querySelector('.duplicate-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        duplicateConversation(conv.id);
+      });
       div.querySelector('.delete-btn').addEventListener('click', () => showDeleteDialog(conv.id));
       conversationList.appendChild(div);
     });
   }
 
-  // ─── Image paste handling ──────────────────────────
+  // ─── Move-to-project dialog ────────────────────────
+  function showMoveProjectDialog(convId) {
+    if (!moveProjectDialog) return;
+    moveProjectTargetConvId = convId;
+    const conv = state.conversations[convId];
+    if (moveProjectConvTitle) {
+      moveProjectConvTitle.textContent = `"${conv ? conv.title : convId}"`;
+    }
+    // Populate select
+    moveProjectSelect.innerHTML = '<option value="">— No Project (All Chats) —</option>';
+    Object.values(state.projects)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+      .forEach(proj => {
+        const opt = document.createElement('option');
+        opt.value = proj.id;
+        opt.textContent = proj.name || 'Untitled Project';
+        if (proj.description) opt.title = proj.description;
+        if (conv && conv.projectId === proj.id) opt.selected = true;
+        moveProjectSelect.appendChild(opt);
+      });
+    moveProjectDialog.classList.remove('hidden');
+  }
+
+  function hideMoveProjectDialog() {
+    if (!moveProjectDialog) return;
+    moveProjectDialog.classList.add('hidden');
+    moveProjectTargetConvId = null;
+  }
+
+  function confirmMoveProject() {
+    if (!moveProjectTargetConvId) return;
+    const conv = state.conversations[moveProjectTargetConvId];
+    if (!conv) { hideMoveProjectDialog(); return; }
+    const newProjectId = moveProjectSelect.value || null;
+    conv.projectId = newProjectId || undefined;
+    if (!conv.projectId) delete conv.projectId;
+    saveState();
+    syncConversationToServer(conv);
+    renderConversationList();
+    const projName = newProjectId ? (state.projects[newProjectId]?.name || 'project') : 'All Chats';
+    showToast(`Moved to "${projName}"`, 'success');
+    hideMoveProjectDialog();
+  }
   function handlePaste(e) {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -1514,6 +1642,10 @@
       const completion = u.completion_tokens || 0;
       const cost = estimateCost(u, state.selectedModel);
 
+      // reasoning_tokens comes from the server — ONLY non-zero if thinking actually ran.
+      // This is the sole legitimate proof that extended thinking was active.
+      const reasoningTokens = u.completion_tokens_details?.reasoning_tokens || 0;
+
       // Find previous assistant message's prompt_tokens to compute incremental context
       let prevPrompt = 0;
       const conv = state.conversations[state.activeConversationId];
@@ -1531,11 +1663,15 @@
       tokenHtml = `
         <span class="token-pill" title="Click to see token breakdown">
           <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-          ${turnTotal.toLocaleString()} tokens &middot; ${formatCost(cost)}
+          ${reasoningTokens ? '🧠 ' : ''}${turnTotal.toLocaleString()} tokens &middot; ${formatCost(cost)}
         </span>
         <div class="token-pill-detail">
           <div class="token-pill-row"><span>New context</span><span>${incrementalContext.toLocaleString()}</span></div>
           <div class="token-pill-row"><span>Generated</span><span>${completion.toLocaleString()}</span></div>
+          ${reasoningTokens
+            ? `<div class="token-pill-row token-pill-reasoning"><span>🧠 Thinking (server confirmed)</span><span>${reasoningTokens.toLocaleString()}</span></div>`
+            : `<div class="token-pill-row"><span>Thinking</span><span style="color:var(--text-muted);font-style:italic">none (not active)</span></div>`
+          }
           <div class="token-pill-row"><span>Turn total</span><span>${turnTotal.toLocaleString()}</span></div>
           <div class="token-pill-row"><span>Cumulative ctx</span><span>${prompt.toLocaleString()}</span></div>
           <div class="token-pill-row"><span>Cost</span><span>${formatCost(cost)}</span></div>
@@ -1577,6 +1713,12 @@
       const isLast = conv && messageIndex === conv.messages.length - 1;
       actionsHtml = `
         <div class="message-actions">
+          <button class="msg-action-btn copy-msg-btn" title="Copy message" data-msg-index="${messageIndex}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </button>
           ${isLast ? `<button class="msg-action-btn regen-btn" title="Regenerate response" data-msg-index="${messageIndex}">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="23 4 23 10 17 10"/>
@@ -1608,6 +1750,21 @@
     const regenBtn = div.querySelector('.regen-btn');
     if (regenBtn) {
       regenBtn.addEventListener('click', () => regenerateResponse(messageIndex));
+    }
+
+    // Copy message button
+    const copyMsgBtn = div.querySelector('.copy-msg-btn');
+    if (copyMsgBtn) {
+      copyMsgBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(textContent).then(() => {
+          copyMsgBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>`;
+          copyMsgBtn.title = 'Copied!';
+          setTimeout(() => {
+            copyMsgBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+            copyMsgBtn.title = 'Copy message';
+          }, 2000);
+        });
+      });
     }
 
     // Branch navigation
@@ -1862,12 +2019,16 @@
     state.conversationTokens = lastTurnTokens;
     state.conversationCost = totalCost;
 
+    const sessionTag = state.sessionCost > 0
+      ? ` &nbsp;|&nbsp; <span class="session-cost" title="${state.sessionMessages} message${state.sessionMessages !== 1 ? 's' : ''} this session">Session: ${formatCost(state.sessionCost)}</span>`
+      : '';
+
     if (lastTurnTokens > 0) {
       const promptPart = (lastTurnUsage.prompt_tokens || 0).toLocaleString();
       const outputPart = totalOutputTokens.toLocaleString();
-      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line &nbsp;|&nbsp; <span class="token-stats">${promptPart} ctx + ${outputPart} out (${formatCost(totalCost)})</span>`;
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line &nbsp;|&nbsp; <span class="token-stats">${promptPart} ctx + ${outputPart} out (${formatCost(totalCost)})</span>${sessionTag}`;
     } else {
-      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images`;
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images${sessionTag}`;
     }
   }
 
@@ -2100,6 +2261,7 @@
           messages: truncatedMessages,
           stream: true,
           stream_options: { include_usage: true },
+          reasoning_effort: state.selectedEffort,
         }),
         signal: abortController.signal,
       });
@@ -2187,7 +2349,11 @@
     const assistantMsg = { role: 'assistant', content: fullResponse };
     if (lastUsage) {
       assistantMsg.usage = lastUsage;
+      // Track session-wide cost
+      state.sessionCost += estimateCost(lastUsage, model);
+      state.sessionMessages++;
     }
+    // NOTE: do NOT store effort here — the only real proof is reasoning_tokens in usage
     conv.messages.push(assistantMsg);
     conv.updatedAt = Date.now();
     saveState();
@@ -2455,7 +2621,6 @@
       if (isLogSelectionActive()) return;
 
       const shouldScroll = logAutoScroll.checked;
-      const wasAtBottom = logPanelBody.scrollTop + logPanelBody.clientHeight >= logPanelBody.scrollHeight - 20;
 
       logPanelBody.innerHTML = '';
       if (data.lines.length === 0) {
@@ -2472,7 +2637,7 @@
       });
       logPanelBody.appendChild(fragment);
 
-      if (shouldScroll || wasAtBottom) {
+      if (shouldScroll) {
         logPanelBody.scrollTop = logPanelBody.scrollHeight;
       }
     } catch (e) {
@@ -2625,7 +2790,32 @@
       localStorage.setItem(MODEL_KEY, state.selectedModel);
       clearFallbackNotice();
       updateContextBar();
+      applyEffortUI();
     });
+
+    // ─── Effort buttons (mirrors CLI /model effort slider) ────────────
+    function applyEffortUI() {
+      document.querySelectorAll('.effort-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.effort === state.selectedEffort);
+      });
+      // Update the effort label to show current level, like CLI's "▪▪▪ High"
+      const label = document.querySelector('.effort-label');
+      if (label) {
+        const cap = state.selectedEffort.charAt(0).toUpperCase() + state.selectedEffort.slice(1);
+        label.textContent = cap;
+      }
+    }
+
+    document.querySelectorAll('.effort-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        state.selectedEffort = btn.dataset.effort;
+        localStorage.setItem(EFFORT_KEY, state.selectedEffort);
+        applyEffortUI();
+      });
+    });
+
+    // Sync effort UI with restored state on load
+    applyEffortUI();
 
     themeToggle.addEventListener('click', toggleTheme);
 
@@ -2694,6 +2884,23 @@
       projectDialog.addEventListener('click', (e) => { if (e.target === projectDialog) hideProjectDialog(); });
     }
 
+    // Move-to-project dialog events
+    if (moveProjectCancelBtn) moveProjectCancelBtn.addEventListener('click', hideMoveProjectDialog);
+    if (moveProjectConfirmBtn) moveProjectConfirmBtn.addEventListener('click', confirmMoveProject);
+    if (moveProjectDialog) {
+      moveProjectDialog.addEventListener('click', (e) => { if (e.target === moveProjectDialog) hideMoveProjectDialog(); });
+    }
+
+    // Topbar active-project badge — click to open project settings
+    if (activeProjectBadge) {
+      activeProjectBadge.addEventListener('click', () => {
+        if (state.activeProjectId) showProjectDialog(state.activeProjectId);
+      });
+    }
+
+    // Initialise badge on load
+    updateActiveProjectBadge();
+
     // Sidebar search
     if (sidebarSearchInput) {
       let searchTimeout;
@@ -2758,6 +2965,12 @@
     if (logSourceSelector) {
       logSourceSelector.addEventListener('change', fetchLogs);
     }
+
+    // Auto-uncheck "Auto" scroll when user scrolls up; re-check when back at bottom
+    logPanelBody.addEventListener('scroll', () => {
+      const atBottom = logPanelBody.scrollTop + logPanelBody.clientHeight >= logPanelBody.scrollHeight - 20;
+      logAutoScroll.checked = atBottom;
+    });
   }
 
   // ─── Start ────────────────────────────────────────

@@ -768,6 +768,9 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         """Route HTTP access logs to our logger instead of stderr."""
         msg = format % args if args else format
+        # Suppress Chrome DevTools browser config probe — harmless, always 404
+        if '.well-known/appspecific/com.chrome.devtools' in msg:
+            return
         if '404' in msg or 'error' in msg.lower():
             log.warning(msg)
         else:
