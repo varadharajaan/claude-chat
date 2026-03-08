@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Claude Chat</title>
-  <link rel="stylesheet" href="styles.css?v=8">
+  <link rel="stylesheet" href="styles.css?v=10">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
 </head>
 <body>
@@ -22,6 +22,34 @@
           <path d="M12 5v14M5 12h14"/>
         </svg>
       </button>
+    </div>
+
+    <!-- Project Switcher -->
+    <div class="project-switcher" id="projectSwitcher">
+      <select class="project-select" id="projectSelect">
+        <option value="">All Chats</option>
+        <!-- Projects populated by JS -->
+      </select>
+      <button class="project-settings-btn" id="projectSettingsBtn" title="Project settings">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <button class="project-add-btn" id="projectAddBtn" title="New project">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Search bar -->
+    <div class="sidebar-search">
+      <svg class="sidebar-search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input type="text" class="sidebar-search-input" id="sidebarSearch" placeholder="Search conversations...">
     </div>
 
     <div class="sidebar-conversations" id="conversationList">
@@ -78,6 +106,14 @@
         </select>
       </div>
       <div class="topbar-spacer"></div>
+      <!-- Export button -->
+      <button class="topbar-action-btn" id="exportBtn" title="Export conversation as Markdown">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      </button>
       <button class="log-toggle-btn" id="logToggleBtn" title="Toggle server logs">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -144,9 +180,13 @@
               </button>
             </div>
           </div>
-          <p class="input-hint">
+          <p class="input-hint" id="inputHint">
             <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images
           </p>
+          <div class="context-bar-wrapper hidden" id="contextBarWrapper">
+            <div class="context-bar"><div class="context-bar-fill" id="contextBarFill"></div></div>
+            <span class="context-bar-label" id="contextBarLabel">0%</span>
+          </div>
         </div>
       </div>
 
@@ -239,6 +279,42 @@
     </div>
   </div>
 
-  <script src="app.js?v=8"></script>
+  <!-- Project Settings dialog -->
+  <div class="dialog-overlay hidden" id="projectDialog">
+    <div class="dialog dialog-wide">
+      <h3 class="dialog-title" id="projectDialogTitle">Project Settings</h3>
+      <div class="project-form">
+        <label class="project-form-label">Name</label>
+        <input type="text" class="dialog-input" id="projectNameInput" placeholder="My Project">
+        <label class="project-form-label">Description <span class="label-hint">(optional)</span></label>
+        <input type="text" class="dialog-input" id="projectDescInput" placeholder="What is this project about?">
+        <label class="project-form-label">System Prompt</label>
+        <textarea class="dialog-textarea" id="projectSystemPrompt" rows="5" placeholder="Custom instructions for all conversations in this project..."></textarea>
+        <label class="project-form-label">Knowledge Files <span class="label-hint">(text, code, PDF, DOCX, images)</span></label>
+        <div class="knowledge-files-area" id="knowledgeFilesArea">
+          <!-- Knowledge file items populated by JS -->
+        </div>
+        <button class="knowledge-add-btn" id="knowledgeAddBtn">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          Add knowledge file
+        </button>
+      </div>
+      <div class="dialog-actions">
+        <button class="dialog-btn dialog-btn-danger" id="projectDeleteBtn" style="margin-right:auto">Delete Project</button>
+        <button class="dialog-btn dialog-btn-cancel" id="projectCancelBtn">Cancel</button>
+        <button class="dialog-btn dialog-btn-confirm" id="projectSaveBtn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script>
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+  </script>
+  <script src="app.js?v=10"></script>
 </body>
 </html>

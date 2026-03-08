@@ -224,6 +224,39 @@ body {
   color: var(--danger);
 }
 
+/* Star button */
+.conv-star-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+.conversation-item:hover .conv-star-btn {
+  opacity: 0.7;
+}
+.conv-star-btn:hover {
+  opacity: 1 !important;
+}
+.conv-star-btn.active {
+  color: #f59e0b;
+  opacity: 1;
+}
+
+/* Divider between starred and unstarred conversations */
+.conversation-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 12px;
+}
+
 /* Sidebar footer */
 .sidebar-footer {
   padding: 12px 16px;
@@ -915,6 +948,56 @@ body {
   margin-right: auto;
 }
 
+/* --- Context Bar --- */
+.context-bar-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 800px;
+  margin: 4px auto 0;
+  padding: 0 4px;
+}
+
+.context-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.context-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease, background 0.3s ease;
+}
+
+.context-bar-fill.context-warning {
+  background: #f59e0b;
+}
+
+.context-bar-fill.context-danger {
+  background: var(--danger);
+}
+
+.context-bar-label {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 70px;
+  text-align: right;
+}
+
+.context-bar-label.context-warning {
+  color: #f59e0b;
+}
+
+.context-bar-label.context-danger {
+  color: var(--danger);
+}
+
 kbd {
   background: var(--kbd-bg);
   border: 1px solid var(--kbd-border);
@@ -1019,7 +1102,45 @@ kbd {
   background: var(--danger-hover);
 }
 
-/* --- Error toast --- */
+/* --- Toast notifications --- */
+.toast {
+  position: fixed;
+  bottom: 100px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 10px;
+  font-size: 0.875rem;
+  z-index: 300;
+  animation: toastIn 0.3s ease, toastOut 0.3s ease 4s forwards;
+  max-width: 90vw;
+  text-align: center;
+}
+
+.toast-error {
+  background: var(--danger);
+}
+
+.toast-success {
+  background: #16a34a;
+  box-shadow: 0 2px 12px rgba(22, 163, 74, 0.3);
+}
+
+.toast-info {
+  background: #2563eb;
+  box-shadow: 0 2px 12px rgba(37, 99, 235, 0.3);
+}
+
+[data-theme="light"] .toast-info {
+  background: #1d4ed8;
+}
+
+[data-theme="light"] .toast-success {
+  background: #15803d;
+}
+
+/* Legacy error-toast for backward compat */
 .error-toast {
   position: fixed;
   bottom: 100px;
@@ -1483,5 +1604,732 @@ kbd {
   }
   .log-toggle-btn span:not(.log-error-badge) {
     display: none;
+  }
+}
+
+/* =====================================================
+   Phase 1: Projects + System Prompts
+   ===================================================== */
+
+/* --- Project Switcher (sidebar) --- */
+.project-switcher {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-select {
+  flex: 1;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 28px 6px 10px;
+  font-size: 0.8rem;
+  color: var(--text);
+  cursor: pointer;
+  outline: none;
+  font-family: inherit;
+  font-weight: 500;
+  transition: border-color 0.15s;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+.project-select:focus {
+  border-color: var(--accent);
+}
+.project-select option {
+  background: var(--dialog-bg);
+  color: var(--text);
+}
+
+.project-settings-btn,
+.project-add-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+  flex-shrink: 0;
+}
+.project-settings-btn:hover,
+.project-add-btn:hover {
+  color: var(--text);
+  background: var(--sidebar-hover);
+  border-color: var(--text-muted);
+}
+
+/* --- Sidebar Search --- */
+.sidebar-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-search-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.sidebar-search-input {
+  flex: 1;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  color: var(--text);
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+  min-width: 0;
+}
+.sidebar-search-input:focus {
+  border-color: var(--accent);
+}
+.sidebar-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* Empty state in sidebar when no conversations match */
+.sidebar-empty {
+  padding: 20px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+/* --- Project Settings Dialog --- */
+.dialog-wide {
+  width: 520px;
+  max-width: 95vw;
+}
+
+.dialog-textarea {
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 0.875rem;
+  color: var(--text);
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  min-height: 80px;
+  margin-bottom: 16px;
+  transition: border-color 0.15s;
+  line-height: 1.5;
+}
+.dialog-textarea:focus {
+  border-color: var(--accent);
+}
+.dialog-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.project-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+
+.project-form-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-top: 8px;
+  margin-bottom: 4px;
+}
+.project-form-label:first-child {
+  margin-top: 0;
+}
+
+.label-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+/* --- Knowledge Files --- */
+.knowledge-files-area {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  min-height: 48px;
+  margin-bottom: 8px;
+  background: var(--input-bg);
+}
+
+.knowledge-empty {
+  padding: 10px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.knowledge-file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  margin-bottom: 4px;
+  animation: fadeIn 0.2s ease;
+}
+.knowledge-file-item:last-child {
+  margin-bottom: 0;
+}
+
+.knowledge-file-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.knowledge-file-name {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.knowledge-file-size {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.knowledge-file-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.12s, background 0.12s;
+  flex-shrink: 0;
+}
+.knowledge-file-remove:hover {
+  color: var(--danger);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.knowledge-add-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-family: inherit;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+  width: 100%;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+.knowledge-add-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+/* --- Knowledge file loading / progress --- */
+.knowledge-file-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  margin-bottom: 4px;
+  animation: fadeIn 0.2s ease;
+}
+
+.knowledge-file-loading .knowledge-file-name {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+}
+
+.knowledge-progress-bar {
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.knowledge-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.15s ease;
+}
+
+.knowledge-file-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.knowledge-badge-pdf {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+.knowledge-badge-docx {
+  background: rgba(37, 99, 235, 0.15);
+  color: #2563eb;
+}
+.knowledge-badge-img {
+  background: rgba(5, 150, 105, 0.15);
+  color: #059669;
+}
+
+/* Image thumbnail in knowledge files list */
+.knowledge-image-thumb {
+  width: 80px;
+  height: 60px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.knowledge-file-tokens {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+}
+
+/* --- Knowledge context summary --- */
+.knowledge-context-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--accent-subtle);
+  border: 1px solid var(--border);
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.knowledge-context-summary.context-heavy {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: #f59e0b;
+}
+
+/* =====================================================
+   Phase 2: Export + Token Stats
+   ===================================================== */
+
+/* --- Export / Topbar action buttons --- */
+.topbar-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.topbar-action-btn:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+/* --- Token Usage Display --- */
+.message-tokens {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 6px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+
+/* --- Per-message token pill (click to expand) --- */
+.token-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  user-select: none;
+  white-space: nowrap;
+  margin-left: auto;
+}
+.token-pill:hover {
+  background: var(--sidebar-hover);
+  border-color: var(--text-muted);
+  color: var(--text-secondary);
+}
+.token-pill svg {
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+.token-pill-detail {
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  animation: fadeIn 0.15s ease;
+}
+.token-pill-detail.open {
+  display: flex;
+}
+.token-pill-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+.token-pill-row span:first-child {
+  color: var(--text-secondary);
+}
+.token-pill-row.token-pill-total {
+  border-top: 1px solid var(--border);
+  padding-top: 3px;
+  margin-top: 1px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* --- Live streaming token counter --- */
+.streaming-tokens {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--accent-subtle);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  font-size: 0.68rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  margin-top: 6px;
+  animation: fadeIn 0.2s ease;
+  white-space: nowrap;
+}
+.streaming-tokens .streaming-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse-dot 1s ease infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.token-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+/* Token display in the input hint area (cumulative) */
+.input-hint .token-stats {
+  display: inline;
+  margin-left: 4px;
+}
+
+/* =====================================================
+   Phase 3: Message Actions, Editing & Branching
+   ===================================================== */
+
+/* --- Message Body wrapper (for edit mode support) --- */
+.message-body {
+  flex: 1;
+  min-width: 0;
+}
+
+/* --- Message Action Buttons (hover reveal) --- */
+.message-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.message:hover .message-actions {
+  opacity: 1;
+}
+
+/* Keep actions visible when in edit mode */
+.message.edit-mode .message-actions {
+  opacity: 1;
+}
+
+.msg-action-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  font-family: inherit;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.msg-action-btn:hover {
+  color: var(--text);
+  background: var(--sidebar-hover);
+  border-color: var(--border);
+}
+
+.edit-msg-btn:hover {
+  color: var(--accent);
+}
+
+.regen-btn:hover {
+  color: var(--accent);
+}
+
+/* --- Edit Mode --- */
+.message.edit-mode .message-content {
+  display: none;
+}
+
+.edit-textarea {
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 0.95rem;
+  color: var(--text);
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.55;
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+  transition: border-color 0.15s;
+}
+.edit-textarea:focus {
+  border-color: var(--accent);
+}
+
+.edit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: flex-end;
+}
+
+.edit-cancel-btn,
+.edit-confirm-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: none;
+  font-size: 0.82rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.edit-cancel-btn {
+  background: var(--bg-secondary);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.edit-cancel-btn:hover {
+  background: var(--sidebar-hover);
+}
+
+.edit-confirm-btn {
+  background: var(--accent);
+  color: #fff;
+}
+.edit-confirm-btn:hover {
+  background: var(--accent-hover);
+}
+
+/* --- Branch Navigation --- */
+.branch-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  vertical-align: middle;
+}
+
+.branch-arrow {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.12s, background 0.12s;
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.branch-arrow:hover {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+.branch-arrow:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.branch-arrow:disabled:hover {
+  color: var(--text-muted);
+  background: none;
+}
+
+.branch-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  min-width: 28px;
+  text-align: center;
+}
+
+/* =====================================================
+   Responsive additions for new features
+   ===================================================== */
+@media (max-width: 768px) {
+  /* Project switcher stacks tighter on mobile */
+  .project-switcher {
+    padding: 6px 10px;
+    gap: 4px;
+  }
+
+  .project-select {
+    font-size: 0.75rem;
+    padding: 5px 24px 5px 8px;
+  }
+
+  /* Sidebar search tighter */
+  .sidebar-search {
+    padding: 6px 10px;
+  }
+
+  /* Message actions always visible on touch devices */
+  .message-actions {
+    opacity: 1;
+  }
+
+  /* Export button hides text */
+  .topbar-action-btn {
+    padding: 6px;
+  }
+
+  /* Project dialog responsive */
+  .dialog-wide {
+    width: 95vw;
+  }
+
+  /* Branch nav more compact on mobile */
+  .branch-nav {
+    margin-left: 0;
+    margin-top: 4px;
+  }
+
+  /* Context bar responsive */
+  .context-bar-wrapper {
+    padding: 0 2px;
+  }
+  .context-bar-label {
+    font-size: 0.62rem;
+    min-width: 60px;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Knowledge files area tighter */
+  .knowledge-file-item {
+    padding: 4px 6px;
+  }
+
+  .knowledge-file-name {
+    font-size: 0.78rem;
+  }
+
+  /* Message tokens wrap */
+  .message-tokens {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  /* Edit textarea smaller min height */
+  .edit-textarea {
+    min-height: 48px;
+    padding: 8px 10px;
   }
 }

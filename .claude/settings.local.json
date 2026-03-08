@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(/tmp/css_classes_report.md:*)",
+      "Read(//tmp/**)",
+      "WebSearch",
+      "Bash(node:*)",
+      "WebFetch(domain:support.anthropic.com)",
+      "WebFetch(domain:www.anthropic.com)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:support.claude.com)",
+      "WebFetch(domain:www.wikihow.com)",
+      "WebFetch(domain:zapier.com)",
+      "WebFetch(domain:www.datacamp.com)",
+      "WebFetch(domain:www.tomsguide.com)",
+      "WebFetch(domain:litellm.vercel.app)"
+    ]
+  }
+}

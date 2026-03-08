@@ -4,6 +4,7 @@ Serves the chat UI + provides API endpoints for:
   - /api/logs          — LiteLLM proxy log viewer
   - /api/logs/clear    — Clear the LiteLLM log
   - /api/conversations — Server-side chat history (CRUD)
+  - /api/projects      — Project management (CRUD) with system prompts
 
 Run:  python server.py
 Opens: http://localhost:8090
@@ -42,6 +43,7 @@ else:
             break
     LITELLM_LOG_FILE = _DEFAULT_PROXY_DIR / "litellm.log"
 HISTORY_DIR = DATA_DIR / "conversations"
+PROJECTS_DIR = DATA_DIR / "projects"
 BACKUP_DIR = DATA_DIR / "backups"
 
 # ─── Backup Configuration ─────────────────────────
@@ -160,6 +162,81 @@ class ChatHistory:
 
 
 history = ChatHistory(HISTORY_DIR)
+
+
+# ─── Project Store (file-backed) ─────────────────
+class ProjectStore:
+    """
+    Server-side project storage using JSON files.
+    Each project is stored as data/projects/{id}.json
+    Projects group conversations and hold system prompts + knowledge files.
+    """
+
+    def __init__(self, directory):
+        self.dir = Path(directory)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _path(self, proj_id):
+        safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '', proj_id)
+        return self.dir / f"{safe_id}.json"
+
+    def list_all(self):
+        """Return list of project summaries."""
+        summaries = []
+        for f in self.dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                summaries.append({
+                    "id": data.get("id", f.stem),
+                    "name": data.get("name", "Untitled"),
+                    "description": data.get("description", ""),
+                    "createdAt": data.get("createdAt", 0),
+                    "updatedAt": data.get("updatedAt", 0),
+                    "hasSystemPrompt": bool(data.get("systemPrompt", "")),
+                    "knowledgeFileCount": len(data.get("knowledgeFiles", [])),
+                })
+            except Exception as e:
+                log.warning(f"Skipping corrupt project file {f.name}: {e}")
+        summaries.sort(key=lambda x: x["updatedAt"], reverse=True)
+        return summaries
+
+    def get(self, proj_id):
+        """Return full project data or None."""
+        path = self._path(proj_id)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error(f"Failed to read project {proj_id}: {e}")
+            return None
+
+    def save(self, proj_data):
+        """Save a project (create or update). Returns True on success."""
+        proj_id = proj_data.get("id")
+        if not proj_id:
+            return False
+        path = self._path(proj_id)
+        try:
+            with self._lock:
+                path.write_text(json.dumps(proj_data, ensure_ascii=False), encoding="utf-8")
+            return True
+        except Exception as e:
+            log.error(f"Failed to save project {proj_id}: {e}")
+            return False
+
+    def delete(self, proj_id):
+        """Delete a project. Returns True if deleted."""
+        path = self._path(proj_id)
+        with self._lock:
+            if path.exists():
+                path.unlink()
+                return True
+        return False
+
+
+projects = ProjectStore(PROJECTS_DIR)
 
 
 # ─── Conversation Backups ─────────────────────────
@@ -308,15 +385,26 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         # Backup API
         elif path == '/api/backups':
             self.handle_list_backups()
+        # Project API
+        elif path == '/api/projects':
+            self.handle_list_projects()
+        elif path.startswith('/api/projects/'):
+            proj_id = path.split('/api/projects/', 1)[1].rstrip('/')
+            if proj_id:
+                self.handle_get_project(proj_id)
+            else:
+                self.handle_list_projects()
         # Conversation API
         elif path == '/api/conversations':
-            self.handle_list_conversations()
+            self.handle_list_conversations(parsed)
+        elif path == '/api/conversations/search':
+            self.handle_search_conversations(parsed)
         elif path.startswith('/api/conversations/'):
             conv_id = path.split('/api/conversations/', 1)[1].rstrip('/')
             if conv_id:
                 self.handle_get_conversation(conv_id)
             else:
-                self.handle_list_conversations()
+                self.handle_list_conversations(parsed)
         else:
             super().do_GET()
 
@@ -328,6 +416,8 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_save_conversation()
         elif path == '/api/conversations/import':
             self.handle_import_conversations()
+        elif path == '/api/projects':
+            self.handle_save_project()
         elif path == '/api/backups/snapshot':
             self.handle_take_snapshot()
         elif path == '/api/backups/restore':
@@ -345,6 +435,12 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.handle_delete_conversation(conv_id)
             else:
                 self.send_error(400)
+        elif path.startswith('/api/projects/'):
+            proj_id = path.split('/api/projects/', 1)[1].rstrip('/')
+            if proj_id:
+                self.handle_delete_project(proj_id)
+            else:
+                self.send_error(400)
         else:
             self.send_error(404)
 
@@ -358,11 +454,72 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
 
     # ─── Conversation endpoints ─────────────────────
 
-    def handle_list_conversations(self):
-        """GET /api/conversations — list all conversation summaries."""
+    def handle_list_conversations(self, parsed=None):
+        """GET /api/conversations — list all conversation summaries.
+        Optional ?projectId= to filter by project."""
         summaries = history.list_all()
+        if parsed:
+            params = urllib.parse.parse_qs(parsed.query)
+            project_id = params.get('projectId', [''])[0]
+            if project_id:
+                # Filter: only conversations belonging to this project
+                filtered = []
+                for s in summaries:
+                    conv = history.get(s['id'])
+                    if conv and conv.get('projectId') == project_id:
+                        filtered.append(s)
+                summaries = filtered
         self.send_json({'ok': True, 'conversations': summaries})
         log.info(f"Listed {len(summaries)} conversations")
+
+    def handle_search_conversations(self, parsed):
+        """GET /api/conversations/search?q=term — full-text search across conversations."""
+        params = urllib.parse.parse_qs(parsed.query)
+        query = params.get('q', [''])[0].lower().strip()
+        if not query:
+            self.send_json({'ok': True, 'results': []})
+            return
+
+        results = []
+        for f in history.dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                title = data.get("title", "")
+                messages = data.get("messages", [])
+
+                # Search in title
+                match_in_title = query in title.lower()
+
+                # Search in message contents
+                match_in_messages = False
+                matching_preview = ""
+                for msg in messages:
+                    content = msg.get("content", "")
+                    if isinstance(content, dict):
+                        content = content.get("text", "")
+                    if isinstance(content, str) and query in content.lower():
+                        match_in_messages = True
+                        # Extract a snippet around the match
+                        idx = content.lower().index(query)
+                        start = max(0, idx - 40)
+                        end = min(len(content), idx + len(query) + 40)
+                        matching_preview = ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
+                        break
+
+                if match_in_title or match_in_messages:
+                    results.append({
+                        "id": data.get("id", f.stem),
+                        "title": title,
+                        "updatedAt": data.get("updatedAt", 0),
+                        "matchInTitle": match_in_title,
+                        "preview": matching_preview,
+                    })
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x["updatedAt"], reverse=True)
+        self.send_json({'ok': True, 'results': results})
+        log.info(f"Search '{query}': {len(results)} results")
 
     def handle_get_conversation(self, conv_id):
         """GET /api/conversations/:id — get full conversation."""
@@ -416,6 +573,48 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         count = history.import_bulk(conversations)
         log.info(f"Imported {count} conversations from client")
         self.send_json({'ok': True, 'imported': count})
+
+    # ─── Project endpoints ──────────────────────────
+
+    def handle_list_projects(self):
+        """GET /api/projects — list all project summaries."""
+        summaries = projects.list_all()
+        self.send_json({'ok': True, 'projects': summaries})
+
+    def handle_get_project(self, proj_id):
+        """GET /api/projects/:id — get full project data."""
+        data = projects.get(proj_id)
+        if data:
+            self.send_json({'ok': True, 'project': data})
+        else:
+            self.send_json({'ok': False, 'error': 'Project not found'})
+
+    def handle_save_project(self):
+        """POST /api/projects — save/update a project."""
+        body = self._read_body()
+        if not body:
+            self.send_json({'ok': False, 'error': 'Empty body'})
+            return
+        try:
+            proj_data = json.loads(body)
+        except json.JSONDecodeError as e:
+            self.send_json({'ok': False, 'error': f'Invalid JSON: {e}'})
+            return
+
+        if projects.save(proj_data):
+            proj_id = proj_data.get("id", "?")
+            log.info(f"Saved project {proj_id}: {proj_data.get('name', '?')}")
+            self.send_json({'ok': True})
+        else:
+            self.send_json({'ok': False, 'error': 'Failed to save'})
+
+    def handle_delete_project(self, proj_id):
+        """DELETE /api/projects/:id — delete a project."""
+        if projects.delete(proj_id):
+            log.info(f"Deleted project {proj_id}")
+            self.send_json({'ok': True})
+        else:
+            self.send_json({'ok': False, 'error': 'Not found'})
 
     # ─── Backup endpoints ─────────────────────────────
 
@@ -582,6 +781,7 @@ def main():
     # Ensure data directories exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
     # Take an initial snapshot on startup, then start the periodic timer
@@ -594,6 +794,7 @@ def main():
     log.info(f"Chat log: {CHAT_LOG_FILE}")
     log.info(f"LiteLLM log: {LITELLM_LOG_FILE}")
     log.info(f"Chat history: {HISTORY_DIR}")
+    log.info(f"Projects: {PROJECTS_DIR}")
     log.info(f"Backups: {BACKUP_DIR}")
     print(f'\nClaude Chat server running at {url}')
     print(f'Press Ctrl+C to stop\n')

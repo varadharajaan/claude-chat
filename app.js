@@ -1,7 +1,8 @@
 /* =====================================================
    Claude Chat — app.js
    Chat logic, streaming API, conversation management,
-   log viewer, grouped model selector
+   log viewer, grouped model selector, projects,
+   search, export, token stats, branching
    ===================================================== */
 
 (function () {
@@ -12,8 +13,124 @@
   const THEME_KEY = 'claude-chat-theme';
   const MODEL_KEY = 'claude-chat-model';
   const PROXY_KEY = 'claude-chat-proxy';
+  const PROJECT_KEY = 'claude-chat-active-project';
   const LOG_POLL_INTERVAL = 3000; // ms
   const LOG_WIDTH_KEY = 'claude-chat-log-width';
+
+  // ─── Token cost estimates per 1M tokens (input/output) — FALLBACK only ───
+  // These are used when the proxy's /model/info endpoint is unreachable.
+  // Live values are fetched dynamically at startup and cached in modelInfoCache.
+  const MODEL_COSTS_FALLBACK = {
+    'claude': { input: 15, output: 75 },     // Opus-class
+    'opus': { input: 15, output: 75 },
+    'sonnet': { input: 3, output: 15 },
+    'haiku': { input: 0.25, output: 1.25 },
+    'gpt': { input: 5, output: 15 },
+    'gemini': { input: 1.25, output: 5 },
+    'default': { input: 3, output: 15 },
+  };
+
+  // ─── Context window sizes (tokens) — FALLBACK only ────────────────
+  const MODEL_CONTEXT_WINDOWS_FALLBACK = {
+    'opus-1m': 1000000, 'sonnet-1m': 1000000,
+    'opus': 200000, 'sonnet': 200000, 'haiku': 200000,
+    'claude': 200000, 'gpt-4o': 128000, 'gpt-4-turbo': 128000,
+    'gpt-4': 8192, 'gpt-3.5': 16385, 'o1': 200000, 'o3': 200000,
+    'gemini-2': 1048576, 'gemini-1.5': 1048576, 'gemini': 1048576,
+    'gpt': 128000, 'default': 128000,
+  };
+
+  // ─── Dynamic model info cache (populated from /model/info) ─────
+  // Maps model ID → { max_tokens, max_input_tokens, input_cost_per_token, output_cost_per_token }
+  let modelInfoCache = {};
+  const CONTEXT_WARN = 0.80;
+  const CONTEXT_BLOCK = 0.95;
+
+  function estimateTokens(text) {
+    if (!text) return 0;
+    return Math.ceil(text.length / 4);
+  }
+
+  function formatTokenCount(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function getContextWindowSize(modelId) {
+    if (!modelId) return MODEL_CONTEXT_WINDOWS_FALLBACK['default'];
+
+    // Try live data first
+    const info = modelInfoCache[modelId];
+    if (info) {
+      const ctx = info.max_input_tokens || info.max_tokens;
+      if (ctx) return ctx;
+    }
+
+    // Fallback to hardcoded
+    const lower = modelId.toLowerCase();
+    const keys = Object.keys(MODEL_CONTEXT_WINDOWS_FALLBACK).sort((a, b) => b.length - a.length);
+    for (const key of keys) {
+      if (key !== 'default' && lower.includes(key)) {
+        return MODEL_CONTEXT_WINDOWS_FALLBACK[key];
+      }
+    }
+    return MODEL_CONTEXT_WINDOWS_FALLBACK['default'];
+  }
+
+  function calculateContextUsage() {
+    const conv = state.conversations[state.activeConversationId];
+    const modelId = modelSelector ? modelSelector.value : state.selectedModel;
+    const windowSize = getContextWindowSize(modelId);
+
+    // System prompt + knowledge tokens
+    const { text: sysText, images: sysImages } = getActiveProjectSystemPrompt();
+    const systemTokens = estimateTokens(sysText) + (sysImages.length * 1000);
+
+    // Knowledge tokens (subset of system)
+    let knowledgeTokens = 0;
+    if (state.activeProjectId && state.projects[state.activeProjectId]) {
+      const proj = state.projects[state.activeProjectId];
+      if (proj.knowledgeFiles && proj.knowledgeFiles.length > 0) {
+        proj.knowledgeFiles.forEach(f => {
+          if (f.sourceType === 'image') {
+            knowledgeTokens += 1000; // ~1K tokens per image estimate
+          } else {
+            knowledgeTokens += estimateTokens(f.content);
+            knowledgeTokens += estimateTokens('--- ' + f.name + ' ---\n');
+          }
+        });
+        knowledgeTokens += estimateTokens('\n\n--- Knowledge Files ---\n');
+      }
+    }
+
+    // Conversation tokens
+    let conversationTokens = 0;
+    if (conv && conv.messages) {
+      conv.messages.forEach(m => {
+        const text = (typeof m.content === 'object' && m.content !== null)
+          ? (m.content.text || '') : (m.content || '');
+        conversationTokens += estimateTokens(text);
+      });
+    }
+
+    // Pending input tokens (what user is currently typing)
+    const pendingText = chatInput ? chatInput.value : '';
+    const pendingTokens = estimateTokens(pendingText);
+
+    const totalTokens = systemTokens + conversationTokens + pendingTokens;
+    const ratio = windowSize > 0 ? totalTokens / windowSize : 0;
+
+    return {
+      systemTokens,
+      knowledgeTokens,
+      conversationTokens,
+      pendingTokens,
+      totalTokens,
+      windowSize,
+      ratio,
+    };
+  }
 
   // ─── State ────────────────────────────────────────
   let state = {
@@ -26,6 +143,12 @@
     logPanelOpen: false,
     logPollTimer: null,
     logErrorCount: 0,
+    // Phase 1: Projects
+    projects: {},
+    activeProjectId: null,
+    // Phase 2: Token stats
+    conversationTokens: 0,
+    conversationCost: 0,
   };
 
   // ─── DOM refs ─────────────────────────────────────
@@ -70,20 +193,43 @@
   // Proxy health refs
   const proxyStatusDot = $('#proxyStatusDot');
 
+  // Phase 1: Project refs
+  const projectSelect = $('#projectSelect');
+  const projectSettingsBtn = $('#projectSettingsBtn');
+  const projectAddBtn = $('#projectAddBtn');
+  const projectDialog = $('#projectDialog');
+  const projectDialogTitle = $('#projectDialogTitle');
+  const projectNameInput = $('#projectNameInput');
+  const projectDescInput = $('#projectDescInput');
+  const projectSystemPrompt = $('#projectSystemPrompt');
+  const knowledgeFilesArea = $('#knowledgeFilesArea');
+  const knowledgeAddBtn = $('#knowledgeAddBtn');
+  const projectSaveBtn = $('#projectSaveBtn');
+  const projectCancelBtn = $('#projectCancelBtn');
+  const projectDeleteBtn = $('#projectDeleteBtn');
+
+  // Phase 2: Search + Export refs
+  const sidebarSearchInput = $('#sidebarSearch');
+  const exportBtn = $('#exportBtn');
+  const inputHint = $('#inputHint');
+
+  // Context bar refs
+  const contextBarWrapper = $('#contextBarWrapper');
+  const contextBarFill = $('#contextBarFill');
+  const contextBarLabel = $('#contextBarLabel');
+
   let pendingRenameId = null;
   let pendingDeleteId = null;
   let pendingImages = []; // Array of { dataUrl, mimeType } for images pasted before sending
+  let editingProjectId = null; // Track which project we're editing in the dialog
+  let projectKnowledgeFiles = []; // Temp storage for knowledge files in dialog
 
   // Image preview area ref
   const imagePreviewArea = $('#imagePreviewArea');
 
   // ─── Model helpers (fully dynamic) ─────────────────
-  // No hardcoded model lists — everything derived from /v1/models response
-  // and validated against the actual backend
-
   const DEAD_MODELS_KEY = 'claude-chat-dead-models';
 
-  // Auto-categorize a model ID into a group
   function getModelGroup(id) {
     if (/^(opus|claude.*opus)/i.test(id)) return 'Claude Opus';
     if (/^(sonnet|claude.*sonnet)/i.test(id)) return 'Claude Sonnet';
@@ -94,20 +240,13 @@
     return 'Other';
   }
 
-  // Auto-generate a friendly label from a model ID
   function getModelLabel(id) {
-    // Strip date suffixes like -20251001 for display purposes
     const cleanId = id.replace(/-\d{8}$/, '');
-
-    // ── Claude models: explicit mapping matching Copilot CLI ──
-    // Short aliases
     if (cleanId === 'opus') return 'Opus 4.6 (default)';
     if (cleanId === 'opus-1m') return 'Opus 4.6 (1M context)';
     if (cleanId === 'sonnet') return 'Sonnet 4.6';
     if (cleanId === 'sonnet-1m') return 'Sonnet 4.6 (1M context)';
     if (cleanId === 'haiku') return 'Haiku 4.5';
-
-    // Long names
     if (cleanId === 'claude-opus-4-6') return 'Opus 4.6 (default)';
     if (cleanId === 'claude-opus-4-6-1m') return 'Opus 4.6 (1M context)';
     if (cleanId === 'claude-opus-4-5') return 'Opus 4.5';
@@ -117,8 +256,6 @@
     if (cleanId === 'claude-sonnet-4-5') return 'Sonnet 4.5';
     if (cleanId === 'claude-haiku-4') return 'Haiku 4.5';
     if (cleanId === 'claude-haiku-4-5') return 'Haiku 4.5';
-
-    // GPT — match Copilot CLI casing: "GPT-5.1-Codex", "GPT-5 mini"
     if (/^gpt/i.test(cleanId)) {
       return cleanId
         .replace(/^gpt/, 'GPT')
@@ -126,8 +263,6 @@
         .replace(/-mini$/i, ' mini')
         .replace(/-max$/i, '-Max');
     }
-
-    // Gemini — "Gemini 2.5 Pro", "Gemini 3 Pro (Preview)"
     if (/^gemini/i.test(cleanId)) {
       let label = cleanId.split('-').map((w, i) => i === 0 ? 'Gemini' : w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
       if (/preview/i.test(cleanId)) {
@@ -135,68 +270,38 @@
       }
       return label;
     }
-
-    // Fallback for any unknown Claude model: strip "claude-" and prettify
     let label = cleanId.replace(/^claude-/, '');
     label = label.replace(/-(\d+)-(\d+)/g, ' $1.$2');
     label = label.replace(/(^|[\s-])(\w)/g, (_, pre, c) => pre + c.toUpperCase());
     label = label.replace(/-/g, ' ');
-
     return label;
   }
 
-  // Sort priority within a group
-  // 1M context models first, then newer versions first (descending)
   function getModelSortKey(id) {
     const cleanId = id.replace(/-\d{8}$/, '');
-    // 1M context models come first (prefix 0)
     if (/1m$/i.test(cleanId)) return '0_' + cleanId;
-    // For all others, invert the string so higher versions sort first
-    // This makes 4-6 appear before 4-5, 5.3 before 5.2, etc.
     return '1_' + cleanId;
   }
 
-  // Group ordering preference
   const GROUP_ORDER = ['Claude Opus', 'Claude Sonnet', 'Claude Haiku', 'GPT Codex', 'GPT', 'Gemini', 'Other'];
 
   // ─── Fallback detection ──────────────────────────
-  // Compares the model you REQUESTED with the model the API ACTUALLY USED.
-  // No hardcoded routing map — we trust the API response's `model` field.
-  // If the backend silently routes to a different model, we detect it here.
-
-  /**
-   * Normalize a model identifier for comparison.
-   * Strips provider prefixes, lowercases, removes date suffixes,
-   * and normalizes separators so "claude-opus-4-6" ≈ "claude-opus-4.6".
-   */
   function normalizeModelId(id) {
     if (!id) return '';
     return id
       .toLowerCase()
-      .replace(/^[a-z_]+\//i, '')                 // strip provider prefix (e.g. "provider/model")
-      .replace(/-\d{8}$/, '')                    // strip date suffix (e.g., -20250929)
-      .replace(/\./g, '-')                       // dots → dashes (4.6 → 4-6)
-      .replace(/\s+/g, '-')                      // spaces → dashes
+      .replace(/^[a-z_]+\//i, '')
+      .replace(/-\d{8}$/, '')
+      .replace(/\./g, '-')
+      .replace(/\s+/g, '-')
       .trim();
   }
 
-  /**
-   * Check if the backend model matches what we requested.
-   * Returns { isFallback: bool, requestedLabel: string, actualLabel: string }
-   *
-   * Pure API-driven: compares the model ID you sent with the model field
-   * in the API response. No hardcoded routing map.
-   */
   function detectFallback(requestedModel, actualBackendModel) {
     if (!actualBackendModel || !requestedModel) return { isFallback: false };
-
     const reqNorm = normalizeModelId(requestedModel);
     const actNorm = normalizeModelId(actualBackendModel);
-
-    // Exact match after normalization — no fallback
     if (reqNorm === actNorm) return { isFallback: false };
-
-    // Different → fallback detected
     return {
       isFallback: true,
       requestedLabel: getModelLabel(requestedModel),
@@ -213,12 +318,9 @@
   }
 
   function prettifyBackendModel(backendModel) {
-    // Strip any "provider/" prefix → just the model name
-    // e.g. "provider/claude-opus-4.6-1m" → "claude-opus-4.6-1m"
     return backendModel.replace(/^[a-z_]+\//i, '');
   }
 
-  // Load dead models from localStorage
   function getDeadModels() {
     try {
       const raw = localStorage.getItem(DEAD_MODELS_KEY);
@@ -241,35 +343,68 @@
     localStorage.setItem(DEAD_MODELS_KEY, JSON.stringify(dead));
   }
 
+  // ─── Token cost helper ─────────────────────────────
+  function getModelCostRate(modelId) {
+    // Try live data first (per-token → per-1M conversion)
+    const info = modelInfoCache[modelId];
+    if (info && (info.input_cost_per_token || info.output_cost_per_token)) {
+      return {
+        input: (info.input_cost_per_token || 0) * 1_000_000,
+        output: (info.output_cost_per_token || 0) * 1_000_000,
+      };
+    }
+
+    // Fallback to hardcoded
+    const lower = (modelId || '').toLowerCase();
+    if (/opus/.test(lower)) return MODEL_COSTS_FALLBACK['opus'];
+    if (/sonnet/.test(lower)) return MODEL_COSTS_FALLBACK['sonnet'];
+    if (/haiku/.test(lower)) return MODEL_COSTS_FALLBACK['haiku'];
+    if (/gpt/.test(lower)) return MODEL_COSTS_FALLBACK['gpt'];
+    if (/gemini/.test(lower)) return MODEL_COSTS_FALLBACK['gemini'];
+    return MODEL_COSTS_FALLBACK['default'];
+  }
+
+  function estimateCost(usage, modelId) {
+    if (!usage) return 0;
+    const rate = getModelCostRate(modelId);
+    const inputCost = (usage.prompt_tokens || 0) / 1_000_000 * rate.input;
+    const outputCost = (usage.completion_tokens || 0) / 1_000_000 * rate.output;
+    return inputCost + outputCost;
+  }
+
+  function formatCost(cost) {
+    if (cost < 0.001) return '<$0.001';
+    if (cost < 0.01) return `~$${cost.toFixed(4)}`;
+    return `~$${cost.toFixed(3)}`;
+  }
+
   // ─── Init ─────────────────────────────────────────
   function init() {
     loadState();
     loadTheme();
     loadProxy();
-    // Clear dead models cache on fresh page load — re-validate from scratch
     localStorage.removeItem(DEAD_MODELS_KEY);
     loadModels();
+    loadProjects();
     renderConversationList();
     if (state.activeConversationId && state.conversations[state.activeConversationId]) {
       renderChat();
     }
     bindEvents();
     autoResize();
-
-    // Check proxy health on startup (non-blocking, no toast on first load)
     checkProxyHealth(true);
-
-    // Initialize log panel resize handle
     initLogResize();
 
-    // Server-side persistence: restore from server if localStorage is empty,
-    // otherwise push local data to server in background
     const hasLocal = Object.keys(state.conversations).length > 0;
     if (!hasLocal) {
       restoreFromServer();
     } else {
       backgroundSync();
     }
+
+    // Update token display for active conversation
+    updateConversationTokenDisplay();
+    updateContextBar();
   }
 
   // ─── Persistence ──────────────────────────────────
@@ -286,6 +421,8 @@
     }
     const savedModel = localStorage.getItem(MODEL_KEY);
     if (savedModel) state.selectedModel = savedModel;
+    const savedProject = localStorage.getItem(PROJECT_KEY);
+    if (savedProject) state.activeProjectId = savedProject;
   }
 
   function saveState() {
@@ -300,22 +437,17 @@
   }
 
   // ─── Server-side persistence (sync layer) ───────
-  // localStorage = fast cache, server = durable backup
-  // Writes are fire-and-forget; reads only on init if localStorage is empty
-
   const SYNC_KEY = 'claude-chat-synced';
 
-  /** Save a single conversation to the server (non-blocking). */
   function syncConversationToServer(conv) {
     const serverUrl = getServerUrl();
     fetch(`${serverUrl}/api/conversations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(conv),
-    }).catch(() => {}); // silent — server may not be running
+    }).catch(() => {});
   }
 
-  /** Delete a conversation on the server (non-blocking). */
   function deleteConversationOnServer(convId) {
     const serverUrl = getServerUrl();
     fetch(`${serverUrl}/api/conversations/${convId}`, {
@@ -323,7 +455,6 @@
     }).catch(() => {});
   }
 
-  /** Push ALL conversations to server (for initial migration). */
   function exportAllToServer() {
     const serverUrl = getServerUrl();
     fetch(`${serverUrl}/api/conversations/import`, {
@@ -338,7 +469,6 @@
     }).catch(() => {});
   }
 
-  /** Load conversations from server (only if localStorage is empty). */
   async function restoreFromServer() {
     try {
       const serverUrl = getServerUrl();
@@ -347,7 +477,6 @@
       const data = await res.json();
       if (!data.ok || !data.conversations || data.conversations.length === 0) return false;
 
-      // Fetch full data for each conversation
       let restored = 0;
       for (const summary of data.conversations) {
         try {
@@ -357,42 +486,32 @@
             state.conversations[summary.id] = cData.conversation;
             restored++;
           }
-        } catch (e) { /* skip this one */ }
+        } catch (e) {}
       }
 
       if (restored > 0) {
-        // Set active to most recent
         const sorted = Object.values(state.conversations)
           .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
         state.activeConversationId = sorted[0]?.id || null;
-        saveState(); // persist to localStorage
+        saveState();
         renderConversationList();
         renderChat();
-        showToast(`Restored ${restored} conversation${restored > 1 ? 's' : ''} from server`);
+        showToast(`Restored ${restored} conversation${restored > 1 ? 's' : ''} from server`, 'success');
         return true;
       }
-    } catch (e) {
-      // Server not running or unreachable — that's fine
-    }
+    } catch (e) {}
     return false;
   }
 
-  /** Background sync: push local to server + pull any missing from server. */
   function backgroundSync() {
     const alreadySynced = localStorage.getItem(SYNC_KEY);
     const hasConversations = Object.keys(state.conversations).length > 0;
-
     if (hasConversations && !alreadySynced) {
-      // First time: bulk export all existing localStorage conversations to server
       exportAllToServer();
     }
-
-    // Also pull any conversations from server that aren't in localStorage
-    // (e.g., created from a different browser)
     mergeFromServer();
   }
 
-  /** Merge server-side conversations that are missing from localStorage. */
   async function mergeFromServer() {
     try {
       const serverUrl = getServerUrl();
@@ -403,9 +522,7 @@
 
       let merged = 0;
       for (const summary of data.conversations) {
-        // Skip if we already have it locally
         if (state.conversations[summary.id]) continue;
-
         try {
           const cRes = await fetch(`${serverUrl}/api/conversations/${summary.id}`);
           const cData = await cRes.json();
@@ -413,17 +530,15 @@
             state.conversations[summary.id] = cData.conversation;
             merged++;
           }
-        } catch (e) { /* skip */ }
+        } catch (e) {}
       }
 
       if (merged > 0) {
         saveState();
         renderConversationList();
-        showToast(`Merged ${merged} conversation${merged > 1 ? 's' : ''} from server`);
+        showToast(`Merged ${merged} conversation${merged > 1 ? 's' : ''} from server`, 'success');
       }
-    } catch (e) {
-      // Server not reachable — that's fine
-    }
+    } catch (e) {}
   }
 
   // ─── Theme ────────────────────────────────────────
@@ -449,26 +564,19 @@
     return (proxyInput.value || 'http://localhost:5000').replace(/\/+$/, '');
   }
 
-  /** Check if the proxy URL is reachable and show green/red indicator + popup.
-   *  @param {boolean} silent — if true, only update the dot indicator (no toast). Used on page load. */
   async function checkProxyHealth(silent) {
     const url = getProxyUrl();
     if (!url) return;
-
-    // Set checking state
     if (proxyStatusDot) {
       proxyStatusDot.className = 'proxy-status-dot checking';
       proxyStatusDot.title = 'Checking...';
     }
-
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(`${url}/health`, { signal: controller.signal });
       clearTimeout(timeout);
-
       if (res.ok) {
-        // Working
         if (proxyStatusDot) {
           proxyStatusDot.className = 'proxy-status-dot ok';
           proxyStatusDot.title = `Proxy is working (${url})`;
@@ -478,13 +586,11 @@
         throw new Error(`HTTP ${res.status}`);
       }
     } catch (e) {
-      // Try /v1/models as fallback (some proxies don't have /health)
       try {
         const controller2 = new AbortController();
         const timeout2 = setTimeout(() => controller2.abort(), 5000);
         const res2 = await fetch(`${url}/v1/models`, { signal: controller2.signal });
         clearTimeout(timeout2);
-
         if (res2.ok) {
           if (proxyStatusDot) {
             proxyStatusDot.className = 'proxy-status-dot ok';
@@ -493,9 +599,7 @@
           if (!silent) showProxyHealthToast(true, url);
           return;
         }
-      } catch (e2) { /* fall through */ }
-
-      // Not working
+      } catch (e2) {}
       if (proxyStatusDot) {
         proxyStatusDot.className = 'proxy-status-dot fail';
         proxyStatusDot.title = `Proxy not reachable (${url})`;
@@ -505,30 +609,20 @@
   }
 
   function showProxyHealthToast(ok, url) {
-    // Remove any existing health toast
     document.querySelectorAll('.proxy-health-toast').forEach(el => el.remove());
-
     const toast = document.createElement('div');
     toast.className = `proxy-health-toast ${ok ? 'ok' : 'fail'}`;
-    toast.textContent = ok
-      ? `Proxy is working`
-      : `Proxy not reachable`;
-
-    // Insert above the proxy config row in sidebar
+    toast.textContent = ok ? `Proxy is working` : `Proxy not reachable`;
     const proxyConfig = document.querySelector('.proxy-config');
     if (proxyConfig) {
       proxyConfig.parentElement.insertBefore(toast, proxyConfig);
     } else {
       document.body.appendChild(toast);
     }
-
-    // Auto-remove after animation
     setTimeout(() => toast.remove(), 3000);
   }
 
-  // ─── Server URL (for log API) ─────────────────────
   function getServerUrl() {
-    // The log server runs on the same origin when using server.py
     return window.location.origin;
   }
 
@@ -540,8 +634,6 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
 
-      // Get all model IDs, filter out wildcard duplicates (ending with *)
-      // Also filter out "fast" variants — fast mode is a speed tier, not a separate model
       const allModels = (data.data || []).map(m => m.id);
       const deadModels = getDeadModels();
       state.models = allModels
@@ -550,14 +642,13 @@
         .filter(id => !deadModels[id])
         .sort();
 
-      // Inject virtual models: the proxy supports these but doesn't list them in /v1/models
-      // 1M context variants and missing version aliases that route to valid backends.
-      // These are also subject to dead-model filtering — if a virtual model returns 400
-      // "not supported", it gets marked dead and won't appear for 1 hour.
+      // Fetch live model info (context windows, pricing) from proxy
+      fetchModelInfo();
+
       const virtualModels = [
-        'claude-opus-4-6-1m',     // 1M context variant
-        'claude-sonnet-4-6-1m',   // 1M context variant
-        'claude-sonnet-4-5',      // version alias
+        'claude-opus-4-6-1m',
+        'claude-sonnet-4-6-1m',
+        'claude-sonnet-4-5',
       ];
       const modelsSetPre = new Set(state.models);
       virtualModels.forEach(vm => {
@@ -571,8 +662,6 @@
         return;
       }
 
-      // Figure out duplicates: short aliases that route to the same backend as a long name
-      // Hide the short alias if the long name exists (keep the descriptive long name)
       const aliasToLong = {
         'opus': 'claude-opus-4-6',
         'opus-1m': 'claude-opus-4-6-1m',
@@ -586,7 +675,6 @@
         if (modelsSet.has(alias) && modelsSet.has(long)) hiddenAliases.add(alias);
       });
 
-      // Also hide date-suffixed duplicates: e.g. claude-haiku-4-5-20251001 when claude-haiku-4-5 exists
       state.models.forEach(id => {
         const dateStripped = id.replace(/-\d{8}$/, '');
         if (dateStripped !== id && modelsSet.has(dateStripped)) {
@@ -594,15 +682,11 @@
         }
       });
 
-      // Hide models that would produce duplicate labels (same backend, same display name)
-      const sameBackend = {
-        'claude-haiku-4-5': 'claude-haiku-4',
-      };
+      const sameBackend = { 'claude-haiku-4-5': 'claude-haiku-4' };
       Object.entries(sameBackend).forEach(([dup, keep]) => {
         if (modelsSet.has(dup) && modelsSet.has(keep)) hiddenAliases.add(dup);
       });
 
-      // Dynamically group models
       const groups = {};
       state.models.forEach(id => {
         if (hiddenAliases.has(id)) return;
@@ -611,36 +695,29 @@
         groups[group].push(id);
       });
 
-      // Sort models within each group: 1M first, then by version descending (newer first)
       Object.keys(groups).forEach(g => {
         groups[g].sort((a, b) => {
           const ka = getModelSortKey(a);
           const kb = getModelSortKey(b);
-          // 1M models (prefix '0_') come first, then within same prefix sort descending
           if (ka[0] !== kb[0]) return ka.localeCompare(kb);
-          return kb.localeCompare(ka); // descending for newer versions first
+          return kb.localeCompare(ka);
         });
       });
 
-      // Render in preferred order
       GROUP_ORDER.forEach(groupName => {
         if (!groups[groupName] || groups[groupName].length === 0) return;
-
         const optgroup = document.createElement('optgroup');
         optgroup.label = groupName;
-
         groups[groupName].forEach(id => {
           const opt = document.createElement('option');
           opt.value = id;
           opt.textContent = getModelLabel(id);
           optgroup.appendChild(opt);
         });
-
         modelSelector.appendChild(optgroup);
         delete groups[groupName];
       });
 
-      // Any remaining ungrouped
       Object.entries(groups).forEach(([groupName, ids]) => {
         if (ids.length === 0) return;
         const optgroup = document.createElement('optgroup');
@@ -654,11 +731,9 @@
         modelSelector.appendChild(optgroup);
       });
 
-      // Restore saved model
       if (state.selectedModel && state.models.includes(state.selectedModel)) {
         modelSelector.value = state.selectedModel;
       } else {
-        // Default preference order: claude-opus-4-6 > opus > first available
         const defaultPref = ['claude-opus-4-6', 'opus'];
         state.selectedModel = defaultPref.find(m => state.models.includes(m)) || state.models[0];
         modelSelector.value = state.selectedModel;
@@ -669,22 +744,485 @@
     }
   }
 
+  // ─── Fetch live model info (context windows, pricing) ────
+  async function fetchModelInfo() {
+    try {
+      const res = await fetch(`${getProxyUrl()}/model/info`);
+      if (!res.ok) return;
+      const data = await res.json();
+      // data.data is an array of { model_name, model_info: { ... } }
+      const models = data.data || data.model_info || [];
+      if (Array.isArray(models)) {
+        models.forEach(entry => {
+          const id = entry.model_name || entry.id;
+          const info = entry.model_info || entry;
+          if (id && info) {
+            modelInfoCache[id] = {
+              max_tokens: info.max_tokens || null,
+              max_input_tokens: info.max_input_tokens || null,
+              max_output_tokens: info.max_output_tokens || null,
+              input_cost_per_token: info.input_cost_per_token || null,
+              output_cost_per_token: info.output_cost_per_token || null,
+            };
+          }
+        });
+      }
+      console.log(`Loaded live model info for ${Object.keys(modelInfoCache).length} models`);
+      // Refresh context bar now that we have real data
+      updateContextBar();
+    } catch (e) {
+      console.warn('Could not fetch /model/info — using fallback values', e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════
+  // PHASE 1: Projects + System Prompts
+  // ═══════════════════════════════════════════════════
+
+  async function loadProjects() {
+    try {
+      const serverUrl = getServerUrl();
+      const res = await fetch(`${serverUrl}/api/projects`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.ok) return;
+
+      state.projects = {};
+      for (const summary of data.projects) {
+        try {
+          const pRes = await fetch(`${serverUrl}/api/projects/${summary.id}`);
+          const pData = await pRes.json();
+          if (pData.ok && pData.project) {
+            state.projects[summary.id] = pData.project;
+          }
+        } catch (e) {}
+      }
+      renderProjectSelect();
+    } catch (e) {
+      console.warn('Failed to load projects', e);
+    }
+  }
+
+  function renderProjectSelect() {
+    if (!projectSelect) return;
+    const currentVal = state.activeProjectId || '';
+    projectSelect.innerHTML = '<option value="">All Chats</option>';
+    const sorted = Object.values(state.projects)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    sorted.forEach(proj => {
+      const opt = document.createElement('option');
+      opt.value = proj.id;
+      opt.textContent = proj.name || 'Untitled Project';
+      projectSelect.appendChild(opt);
+    });
+    projectSelect.value = currentVal;
+  }
+
+  function switchProject(projectId) {
+    state.activeProjectId = projectId || null;
+    localStorage.setItem(PROJECT_KEY, state.activeProjectId || '');
+    renderConversationList();
+    // If current conversation doesn't belong to this project, deselect
+    if (state.activeProjectId && state.activeConversationId) {
+      const conv = state.conversations[state.activeConversationId];
+      if (conv && conv.projectId !== state.activeProjectId) {
+        // Switch to first conversation in this project, or deselect
+        const projectConvs = Object.values(state.conversations)
+          .filter(c => c.projectId === state.activeProjectId)
+          .sort((a, b) => b.updatedAt - a.updatedAt);
+        if (projectConvs.length > 0) {
+          switchConversation(projectConvs[0].id);
+        } else {
+          state.activeConversationId = null;
+          saveState();
+          renderChat();
+        }
+      }
+    }
+    updateContextBar();
+  }
+
+  function showProjectDialog(projectId) {
+    if (projectId && state.projects[projectId]) {
+      // Edit existing project
+      editingProjectId = projectId;
+      const proj = state.projects[projectId];
+      projectDialogTitle.textContent = 'Edit Project';
+      projectNameInput.value = proj.name || '';
+      projectDescInput.value = proj.description || '';
+      projectSystemPrompt.value = proj.systemPrompt || '';
+      projectKnowledgeFiles = [...(proj.knowledgeFiles || [])];
+      projectDeleteBtn.style.display = '';
+    } else {
+      // New project
+      editingProjectId = null;
+      projectDialogTitle.textContent = 'New Project';
+      projectNameInput.value = '';
+      projectDescInput.value = '';
+      projectSystemPrompt.value = '';
+      projectKnowledgeFiles = [];
+      projectDeleteBtn.style.display = 'none';
+    }
+    renderKnowledgeFiles();
+    projectDialog.classList.remove('hidden');
+    projectNameInput.focus();
+  }
+
+  function hideProjectDialog() {
+    projectDialog.classList.add('hidden');
+    editingProjectId = null;
+    projectKnowledgeFiles = [];
+  }
+
+  function renderKnowledgeFiles() {
+    if (!knowledgeFilesArea) return;
+    knowledgeFilesArea.innerHTML = '';
+    if (projectKnowledgeFiles.length === 0) {
+      knowledgeFilesArea.innerHTML = '<div class="knowledge-empty">No knowledge files added yet.</div>';
+      return;
+    }
+
+    let totalTokens = 0;
+    projectKnowledgeFiles.forEach((file, i) => {
+      const div = document.createElement('div');
+      div.className = 'knowledge-file-item';
+
+      const isImage = file.sourceType === 'image';
+      const isPdf = file.sourceType === 'pdf';
+      const isDocx = file.sourceType === 'docx';
+
+      if (isImage) {
+        // Image knowledge file — show thumbnail + IMG badge
+        div.innerHTML = `
+          <div class="knowledge-file-info">
+            <div style="display:flex;align-items:center;gap:6px">
+              <img src="${escapeHtml(file.content)}" class="knowledge-image-thumb" alt="${escapeHtml(file.name)}">
+              <span class="knowledge-file-name">${escapeHtml(file.name)}</span>
+              <span class="knowledge-file-badge knowledge-badge-img">IMG</span>
+            </div>
+          </div>
+          <button class="knowledge-file-remove" title="Remove" data-index="${i}">&times;</button>
+        `;
+      } else {
+        const size = file.content ? `${(file.content.length / 1024).toFixed(1)}KB` : '0KB';
+        const tokens = estimateTokens(file.content);
+        totalTokens += tokens;
+        let badgeHtml = '';
+        if (isPdf) badgeHtml = '<span class="knowledge-file-badge knowledge-badge-pdf">PDF</span>';
+        else if (isDocx) badgeHtml = '<span class="knowledge-file-badge knowledge-badge-docx">DOCX</span>';
+        div.innerHTML = `
+          <div class="knowledge-file-info">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="knowledge-file-name">${escapeHtml(file.name)}</span>
+              ${badgeHtml}
+            </div>
+            <span class="knowledge-file-size">${size} &middot; <span class="knowledge-file-tokens">${formatTokenCount(tokens)} tokens</span></span>
+          </div>
+          <button class="knowledge-file-remove" title="Remove" data-index="${i}">&times;</button>
+        `;
+      }
+      div.querySelector('.knowledge-file-remove').addEventListener('click', () => {
+        projectKnowledgeFiles.splice(i, 1);
+        renderKnowledgeFiles();
+      });
+      knowledgeFilesArea.appendChild(div);
+    });
+
+    // Context summary row
+    const modelId = modelSelector ? modelSelector.value : state.selectedModel;
+    const windowSize = getContextWindowSize(modelId);
+    const pct = windowSize > 0 ? ((totalTokens / windowSize) * 100).toFixed(1) : 0;
+    const isHeavy = (totalTokens / windowSize) > 0.50;
+    const summary = document.createElement('div');
+    summary.className = 'knowledge-context-summary' + (isHeavy ? ' context-heavy' : '');
+    summary.innerHTML = `<span>Total: ${formatTokenCount(totalTokens)} tokens from ${projectKnowledgeFiles.length} file(s)</span><span>${pct}% of ${formatTokenCount(windowSize)} context</span>`;
+    knowledgeFilesArea.appendChild(summary);
+  }
+
+  // ─── PDF extraction ──────────────────────────────
+  async function extractPdfText(file, onProgress) {
+    if (!window.pdfjsLib) {
+      throw new Error('PDF.js not loaded. PDF support requires an internet connection.');
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const totalPages = pdf.numPages;
+    let fullText = '';
+
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map(item => item.str).join(' ');
+      fullText += `[Page ${i}]\n${pageText}\n\n`;
+      if (onProgress) onProgress(i, totalPages);
+    }
+
+    return fullText.trim();
+  }
+
+  function showKnowledgeProgress(fileName) {
+    if (!knowledgeFilesArea) return;
+    const div = document.createElement('div');
+    div.className = 'knowledge-file-loading';
+    div.id = 'knowledgeProgress';
+    div.innerHTML = `
+      <div style="flex:1;min-width:0">
+        <span class="knowledge-file-name">Extracting: ${escapeHtml(fileName)}</span>
+        <div class="knowledge-progress-bar">
+          <div class="knowledge-progress-fill" id="knowledgeProgressFill"></div>
+        </div>
+      </div>
+    `;
+    knowledgeFilesArea.appendChild(div);
+  }
+
+  function updateKnowledgeProgress(current, total) {
+    const fill = document.getElementById('knowledgeProgressFill');
+    if (fill) {
+      fill.style.width = ((current / total) * 100).toFixed(1) + '%';
+    }
+  }
+
+  function removeKnowledgeProgress() {
+    const el = document.getElementById('knowledgeProgress');
+    if (el) el.remove();
+  }
+
+  function addKnowledgeFile() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.txt,.md,.json,.csv,.xml,.html,.py,.js,.ts,.java,.c,.cpp,.h,.css,.yaml,.yml,.toml,.ini,.cfg,.log,.pdf,.docx,.png,.jpg,.jpeg,.gif,.webp';
+    input.addEventListener('change', async () => {
+      const file = input.files[0];
+      if (!file) return;
+
+      const isPdf = file.name.toLowerCase().endsWith('.pdf');
+      const isDocx = file.name.toLowerCase().endsWith('.docx');
+      const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
+      const isImage = imageExtensions.some(ext => file.name.toLowerCase().endsWith(ext));
+
+      if (isImage) {
+        // Image knowledge file — store as data URL
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const dataUrl = ev.target.result;
+          projectKnowledgeFiles.push({
+            name: file.name,
+            content: dataUrl,
+            sourceType: 'image',
+            mimeType: file.type || 'image/png',
+          });
+          renderKnowledgeFiles();
+          showToast(`Image "${file.name}" added as knowledge file.`, 'success');
+        };
+        reader.readAsDataURL(file);
+      } else if (isDocx) {
+        // DOCX extraction with mammoth.js
+        if (!window.mammoth) {
+          showToast('DOCX support requires an internet connection to load mammoth.js.');
+          return;
+        }
+        showKnowledgeProgress(file.name);
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const result = await mammoth.extractRawText({ arrayBuffer });
+          removeKnowledgeProgress();
+
+          if (!result.value || result.value.trim().length === 0) {
+            showToast('This DOCX file has no extractable text.');
+            return;
+          }
+
+          projectKnowledgeFiles.push({
+            name: file.name,
+            content: result.value,
+            sourceType: 'docx',
+          });
+          renderKnowledgeFiles();
+          showToast(`DOCX "${file.name}" extracted successfully.`, 'success');
+        } catch (err) {
+          removeKnowledgeProgress();
+          showToast(`Failed to extract DOCX: ${err.message}`);
+        }
+      } else if (isPdf) {
+        // PDF extraction with progress
+        if (!window.pdfjsLib) {
+          showToast('PDF support requires an internet connection to load pdf.js.');
+          return;
+        }
+        showKnowledgeProgress(file.name);
+        try {
+          const text = await extractPdfText(file, (current, total) => {
+            updateKnowledgeProgress(current, total);
+          });
+          removeKnowledgeProgress();
+
+          if (!text || text.replace(/\[Page \d+\]\s*/g, '').trim().length === 0) {
+            showToast('This PDF has no extractable text (may be a scanned/image-only document).');
+            return;
+          }
+
+          projectKnowledgeFiles.push({
+            name: file.name,
+            content: text,
+            sourceType: 'pdf',
+          });
+          renderKnowledgeFiles();
+          showToast(`PDF "${file.name}" extracted successfully.`, 'success');
+        } catch (err) {
+          removeKnowledgeProgress();
+          showToast(`Failed to extract PDF: ${err.message}`);
+        }
+      } else {
+        // Plain text files
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          projectKnowledgeFiles.push({
+            name: file.name,
+            content: ev.target.result,
+          });
+          renderKnowledgeFiles();
+        };
+        reader.readAsText(file);
+      }
+    });
+    input.click();
+  }
+
+  async function saveProject() {
+    const name = projectNameInput.value.trim();
+    if (!name) {
+      showToast('Project name is required.');
+      return;
+    }
+
+    const projId = editingProjectId || ('proj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
+    const projData = {
+      id: projId,
+      name,
+      description: projectDescInput.value.trim(),
+      systemPrompt: projectSystemPrompt.value.trim(),
+      knowledgeFiles: projectKnowledgeFiles,
+      createdAt: (state.projects[projId]?.createdAt) || Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    try {
+      const serverUrl = getServerUrl();
+      const res = await fetch(`${serverUrl}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(projData),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.projects[projId] = projData;
+        renderProjectSelect();
+        if (!editingProjectId) {
+          // Auto-switch to the new project
+          state.activeProjectId = projId;
+          localStorage.setItem(PROJECT_KEY, projId);
+          projectSelect.value = projId;
+          renderConversationList();
+        }
+        hideProjectDialog();
+        showToast(`Project "${name}" saved.`, 'success');
+      } else {
+        showToast('Failed to save project.');
+      }
+    } catch (e) {
+      showToast('Failed to save project.');
+    }
+  }
+
+  async function deleteProject() {
+    if (!editingProjectId) return;
+    if (!confirm('Delete this project? Conversations will be kept but unlinked.')) return;
+
+    try {
+      const serverUrl = getServerUrl();
+      await fetch(`${serverUrl}/api/projects/${editingProjectId}`, { method: 'DELETE' });
+      // Unlink conversations
+      Object.values(state.conversations).forEach(conv => {
+        if (conv.projectId === editingProjectId) {
+          delete conv.projectId;
+          syncConversationToServer(conv);
+        }
+      });
+      delete state.projects[editingProjectId];
+      if (state.activeProjectId === editingProjectId) {
+        state.activeProjectId = null;
+        localStorage.setItem(PROJECT_KEY, '');
+      }
+      saveState();
+      renderProjectSelect();
+      renderConversationList();
+      hideProjectDialog();
+      showToast('Project deleted.', 'success');
+    } catch (e) {
+      showToast('Failed to delete project.');
+    }
+  }
+
+  function getActiveProjectSystemPrompt() {
+    if (!state.activeProjectId) return { text: null, images: [] };
+    const proj = state.projects[state.activeProjectId];
+    if (!proj) return { text: null, images: [] };
+
+    let prompt = '';
+    if (proj.systemPrompt) {
+      prompt = proj.systemPrompt;
+    }
+
+    const images = [];
+
+    // Append knowledge file contents (split text vs image)
+    if (proj.knowledgeFiles && proj.knowledgeFiles.length > 0) {
+      const textFiles = proj.knowledgeFiles.filter(f => f.sourceType !== 'image');
+      const imageFiles = proj.knowledgeFiles.filter(f => f.sourceType === 'image');
+
+      if (textFiles.length > 0) {
+        const knowledgeContext = textFiles
+          .map(f => `--- ${f.name} ---\n${f.content}`)
+          .join('\n\n');
+        if (prompt) {
+          prompt += '\n\n--- Knowledge Files ---\n' + knowledgeContext;
+        } else {
+          prompt = knowledgeContext;
+        }
+      }
+
+      // Image knowledge files — add text markers + image parts
+      imageFiles.forEach(f => {
+        prompt += (prompt ? '\n\n' : '') + `[Knowledge Image: ${f.name}]`;
+        images.push({ type: 'image_url', image_url: { url: f.content } });
+      });
+    }
+    return { text: prompt || null, images };
+  }
+
   // ─── Conversations ────────────────────────────────
   function createConversation() {
     const id = 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    state.conversations[id] = {
+    const conv = {
       id,
       title: 'New chat',
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    // Associate with active project
+    if (state.activeProjectId) {
+      conv.projectId = state.activeProjectId;
+    }
+    state.conversations[id] = conv;
     state.activeConversationId = id;
     saveState();
-    syncConversationToServer(state.conversations[id]);
+    syncConversationToServer(conv);
     renderConversationList();
     renderChat();
     chatInput.focus();
+    updateConversationTokenDisplay();
     return id;
   }
 
@@ -695,6 +1233,7 @@
     renderConversationList();
     renderChat();
     closeSidebar();
+    updateConversationTokenDisplay();
   }
 
   function deleteConversation(id) {
@@ -707,6 +1246,7 @@
     deleteConversationOnServer(id);
     renderConversationList();
     renderChat();
+    updateConversationTokenDisplay();
   }
 
   function renameConversation(id, newTitle) {
@@ -732,13 +1272,56 @@
   // ─── Render conversation list ─────────────────────
   function renderConversationList() {
     conversationList.innerHTML = '';
-    const sorted = Object.values(state.conversations)
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+    let sorted = Object.values(state.conversations)
+      .sort((a, b) => {
+        // Starred conversations first, then by recency within each group
+        const aStarred = a.starred ? 1 : 0;
+        const bStarred = b.starred ? 1 : 0;
+        if (bStarred !== aStarred) return bStarred - aStarred;
+        return b.updatedAt - a.updatedAt;
+      });
 
-    sorted.forEach(conv => {
+    // Filter by active project
+    if (state.activeProjectId) {
+      sorted = sorted.filter(conv => conv.projectId === state.activeProjectId);
+    }
+
+    // Filter by search query
+    const searchQuery = sidebarSearchInput ? sidebarSearchInput.value.trim().toLowerCase() : '';
+    if (searchQuery) {
+      sorted = sorted.filter(conv => {
+        if (conv.title.toLowerCase().includes(searchQuery)) return true;
+        // Search in message contents
+        return conv.messages.some(m => {
+          const text = typeof m.content === 'object' ? (m.content?.text || '') : (m.content || '');
+          return text.toLowerCase().includes(searchQuery);
+        });
+      });
+    }
+
+    if (sorted.length === 0 && (searchQuery || state.activeProjectId)) {
+      conversationList.innerHTML = '<div class="sidebar-empty">No conversations found.</div>';
+      return;
+    }
+
+    let lastWasStarred = false;
+    sorted.forEach((conv, idx) => {
+      // Insert divider between starred and unstarred groups
+      if (lastWasStarred && !conv.starred) {
+        const divider = document.createElement('div');
+        divider.className = 'conversation-divider';
+        conversationList.appendChild(divider);
+      }
+      lastWasStarred = !!conv.starred;
+
       const div = document.createElement('div');
       div.className = 'conversation-item' + (conv.id === state.activeConversationId ? ' active' : '');
       div.innerHTML = `
+        <button class="conv-star-btn${conv.starred ? ' active' : ''}" title="${conv.starred ? 'Unstar' : 'Star'}">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="${conv.starred ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+          </svg>
+        </button>
         <span class="conversation-title">${escapeHtml(conv.title)}</span>
         <div class="conversation-actions">
           <button class="conv-action-btn rename-btn" title="Rename" data-id="${conv.id}">
@@ -756,8 +1339,16 @@
         </div>
       `;
       div.addEventListener('click', (e) => {
-        if (e.target.closest('.conv-action-btn')) return;
+        if (e.target.closest('.conv-action-btn') || e.target.closest('.conv-star-btn')) return;
         switchConversation(conv.id);
+      });
+      // Star button handler
+      div.querySelector('.conv-star-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        conv.starred = !conv.starred;
+        saveState();
+        syncConversationToServer(conv);
+        renderConversationList();
       });
       div.querySelector('.rename-btn').addEventListener('click', () => showRenameDialog(conv.id));
       div.querySelector('.delete-btn').addEventListener('click', () => showDeleteDialog(conv.id));
@@ -769,7 +1360,6 @@
   function handlePaste(e) {
     const items = e.clipboardData?.items;
     if (!items) return;
-
     for (const item of items) {
       if (item.type.startsWith('image/')) {
         e.preventDefault();
@@ -816,7 +1406,6 @@
       return;
     }
     imagePreviewArea.classList.remove('hidden');
-
     pendingImages.forEach((img, i) => {
       const div = document.createElement('div');
       div.className = 'image-preview-item';
@@ -829,26 +1418,16 @@
     });
   }
 
-  // Build the message content for API — either a string or multimodal array
   function buildMessageContent(text, images) {
-    if (!images || images.length === 0) {
-      return text;
-    }
-    // OpenAI vision format: array of content parts
+    if (!images || images.length === 0) return text;
     const parts = [];
     images.forEach(img => {
-      parts.push({
-        type: 'image_url',
-        image_url: { url: img.dataUrl },
-      });
+      parts.push({ type: 'image_url', image_url: { url: img.dataUrl } });
     });
-    if (text) {
-      parts.push({ type: 'text', text });
-    }
+    if (text) parts.push({ type: 'text', text });
     return parts;
   }
 
-  // Build content for storage (we store images inline as data URLs for localStorage persistence)
   function buildStorageMessage(text, images) {
     return {
       text: text || '',
@@ -866,11 +1445,12 @@
       return;
     }
 
-    conv.messages.forEach(msg => {
-      chatMessages.appendChild(createMessageElement(msg.role, msg.content));
+    conv.messages.forEach((msg, idx) => {
+      chatMessages.appendChild(createMessageElement(msg.role, msg.content, idx, msg));
     });
 
     scrollToBottom();
+    updateContextBar();
   }
 
   function createWelcomeScreen() {
@@ -902,12 +1482,12 @@
     return div;
   }
 
-  function createMessageElement(role, content) {
+  function createMessageElement(role, content, messageIndex, msgData) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
+    div.dataset.messageIndex = messageIndex;
     const avatar = role === 'user' ? 'Y' : 'A';
 
-    // Support both old string format and new {text, images} format
     let textContent = '';
     let images = [];
     if (typeof content === 'object' && content !== null && !Array.isArray(content)) {
@@ -926,12 +1506,125 @@
 
     const renderedContent = role === 'user' ? escapeHtml(textContent) : renderMarkdown(textContent);
 
+    // Token usage display for assistant messages — clickable pill
+    let tokenHtml = '';
+    if (role === 'assistant' && msgData && msgData.usage) {
+      const u = msgData.usage;
+      const prompt = u.prompt_tokens || 0;
+      const completion = u.completion_tokens || 0;
+      const cost = estimateCost(u, state.selectedModel);
+
+      // Find previous assistant message's prompt_tokens to compute incremental context
+      let prevPrompt = 0;
+      const conv = state.conversations[state.activeConversationId];
+      if (conv && conv.messages) {
+        for (let i = messageIndex - 1; i >= 0; i--) {
+          if (conv.messages[i].role === 'assistant' && conv.messages[i].usage) {
+            prevPrompt = conv.messages[i].usage.prompt_tokens || 0;
+            break;
+          }
+        }
+      }
+      const incrementalContext = prompt - prevPrompt;
+      const turnTotal = incrementalContext + completion;
+
+      tokenHtml = `
+        <span class="token-pill" title="Click to see token breakdown">
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          ${turnTotal.toLocaleString()} tokens &middot; ${formatCost(cost)}
+        </span>
+        <div class="token-pill-detail">
+          <div class="token-pill-row"><span>New context</span><span>${incrementalContext.toLocaleString()}</span></div>
+          <div class="token-pill-row"><span>Generated</span><span>${completion.toLocaleString()}</span></div>
+          <div class="token-pill-row"><span>Turn total</span><span>${turnTotal.toLocaleString()}</span></div>
+          <div class="token-pill-row"><span>Cumulative ctx</span><span>${prompt.toLocaleString()}</span></div>
+          <div class="token-pill-row"><span>Cost</span><span>${formatCost(cost)}</span></div>
+        </div>
+      `;
+    }
+
+    // Branch navigation (Phase 3)
+    let branchNav = '';
+    if (msgData && msgData.branches && msgData.branches.length > 0) {
+      const currentIdx = msgData.activeBranch !== undefined && msgData.activeBranch !== null ? msgData.activeBranch + 1 : 0;
+      const total = msgData.branches.length + 1;
+      branchNav = `
+        <div class="branch-nav" data-msg-index="${messageIndex}">
+          <button class="branch-arrow branch-prev" title="Previous version">&lsaquo;</button>
+          <span class="branch-label">${currentIdx + 1} / ${total}</span>
+          <button class="branch-arrow branch-next" title="Next version">&rsaquo;</button>
+        </div>
+      `;
+    }
+
+    // Action buttons for messages
+    let actionsHtml = '';
+    if (role === 'user') {
+      actionsHtml = `
+        <div class="message-actions">
+          <button class="msg-action-btn edit-msg-btn" title="Edit message" data-msg-index="${messageIndex}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+          ${branchNav}
+        </div>
+      `;
+    } else if (role === 'assistant') {
+      // Check if this is the last assistant message
+      const conv = state.conversations[state.activeConversationId];
+      const isLast = conv && messageIndex === conv.messages.length - 1;
+      actionsHtml = `
+        <div class="message-actions">
+          ${isLast ? `<button class="msg-action-btn regen-btn" title="Regenerate response" data-msg-index="${messageIndex}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>` : ''}
+          ${branchNav}
+          ${tokenHtml}
+        </div>
+      `;
+    }
+
     div.innerHTML = `
       <div class="message-wrapper">
         <div class="message-avatar">${avatar}</div>
-        <div class="message-content">${imagesHtml}${renderedContent}</div>
+        <div class="message-body">
+          <div class="message-content">${imagesHtml}${renderedContent}</div>
+          ${actionsHtml}
+        </div>
       </div>
     `;
+
+    // Bind action events
+    const editBtn = div.querySelector('.edit-msg-btn');
+    if (editBtn) {
+      editBtn.addEventListener('click', () => editMessage(messageIndex));
+    }
+
+    const regenBtn = div.querySelector('.regen-btn');
+    if (regenBtn) {
+      regenBtn.addEventListener('click', () => regenerateResponse(messageIndex));
+    }
+
+    // Branch navigation
+    const prevBtn = div.querySelector('.branch-prev');
+    const nextBtn = div.querySelector('.branch-next');
+    if (prevBtn) prevBtn.addEventListener('click', () => switchBranch(messageIndex, -1));
+    if (nextBtn) nextBtn.addEventListener('click', () => switchBranch(messageIndex, 1));
+
+    // Token pill toggle
+    const pill = div.querySelector('.token-pill');
+    const pillDetail = div.querySelector('.token-pill-detail');
+    if (pill && pillDetail) {
+      pill.addEventListener('click', () => {
+        pillDetail.classList.toggle('open');
+      });
+    }
+
     return div;
   }
 
@@ -945,17 +1638,365 @@
     document.body.appendChild(lb);
   };
 
-  // ─── Send message ─────────────────────────────────
-  async function sendMessage() {
-    const text = chatInput.value.trim();
-    const images = [...pendingImages];
+  // ═══════════════════════════════════════════════════
+  // PHASE 3: Conversation Branching + Message Editing
+  // ═══════════════════════════════════════════════════
 
-    if ((!text && images.length === 0) || state.isStreaming) return;
+  function editMessage(messageIndex) {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv) return;
+    const msg = conv.messages[messageIndex];
+    if (!msg || msg.role !== 'user') return;
+
+    const textContent = typeof msg.content === 'object' ? (msg.content.text || '') : (msg.content || '');
+
+    // Find the message element and replace content with textarea
+    const msgEl = chatMessages.querySelector(`[data-message-index="${messageIndex}"]`);
+    if (!msgEl) return;
+    const contentEl = msgEl.querySelector('.message-content');
+
+    contentEl.innerHTML = `
+      <div class="edit-mode">
+        <textarea class="edit-textarea">${escapeHtml(textContent)}</textarea>
+        <div class="edit-actions">
+          <button class="edit-cancel-btn">Cancel</button>
+          <button class="edit-confirm-btn">Send</button>
+        </div>
+      </div>
+    `;
+
+    const textarea = contentEl.querySelector('.edit-textarea');
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    // Auto-resize
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 300) + 'px';
+
+    contentEl.querySelector('.edit-cancel-btn').addEventListener('click', () => {
+      renderChat(); // Re-render to cancel
+    });
+
+    contentEl.querySelector('.edit-confirm-btn').addEventListener('click', () => {
+      const newText = textarea.value.trim();
+      if (!newText) return;
+      confirmEdit(messageIndex, newText);
+    });
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const newText = textarea.value.trim();
+        if (newText) confirmEdit(messageIndex, newText);
+      }
+      if (e.key === 'Escape') renderChat();
+    });
+  }
+
+  function confirmEdit(messageIndex, newContent) {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv) return;
+    const msg = conv.messages[messageIndex];
+
+    const oldContent = msg.content;
+    const oldFollowUp = conv.messages.slice(messageIndex + 1);
+
+    // Store original as a branch
+    if (!msg.branches) msg.branches = [];
+    msg.branches.push({
+      content: oldContent,
+      followUp: oldFollowUp,
+    });
+    msg.activeBranch = null; // null = current (edited) version
+
+    // Update content
+    msg.content = newContent;
+
+    // Truncate messages after this point
+    conv.messages = conv.messages.slice(0, messageIndex + 1);
+    conv.updatedAt = Date.now();
+    saveState();
+    syncConversationToServer(conv);
+
+    // Re-render and re-send
+    renderChat();
+    sendMessage(true); // true = re-send mode (don't add new user message)
+  }
+
+  function regenerateResponse(messageIndex) {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv || state.isStreaming) return;
+    const msg = conv.messages[messageIndex];
+    if (!msg || msg.role !== 'assistant') return;
+
+    // Store current response as a branch
+    if (!msg.branches) msg.branches = [];
+    msg.branches.push({
+      content: msg.content,
+      usage: msg.usage || null,
+    });
+    msg.activeBranch = null;
+
+    // Remove this and any following messages
+    conv.messages = conv.messages.slice(0, messageIndex);
+    conv.updatedAt = Date.now();
+    saveState();
+    syncConversationToServer(conv);
+
+    // Re-render and re-send
+    renderChat();
+    sendMessage(true);
+  }
+
+  function switchBranch(messageIndex, direction) {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv) return;
+    const msg = conv.messages[messageIndex];
+    if (!msg || !msg.branches || msg.branches.length === 0) return;
+
+    const totalVersions = msg.branches.length + 1; // branches + current
+    let currentIdx = msg.activeBranch !== undefined && msg.activeBranch !== null ? msg.activeBranch + 1 : 0;
+    let newIdx = currentIdx + direction;
+    if (newIdx < 0) newIdx = totalVersions - 1;
+    if (newIdx >= totalVersions) newIdx = 0;
+
+    if (newIdx === 0) {
+      // Switch to current (non-branch) version — already the default
+      if (msg.activeBranch !== null && msg.activeBranch !== undefined) {
+        // Swap: current content goes to the branch that was active, branch[0] becomes current
+        // Actually, simpler: index 0 = current content, 1..N = branches[0..N-1]
+        msg.activeBranch = null;
+      }
+    } else {
+      const branchIdx = newIdx - 1;
+      const branch = msg.branches[branchIdx];
+
+      // Swap content
+      const currentContent = msg.content;
+      const currentFollowUp = conv.messages.slice(messageIndex + 1);
+      const currentUsage = msg.usage;
+
+      msg.content = branch.content;
+      msg.usage = branch.usage || null;
+      msg.activeBranch = branchIdx;
+
+      // Update the branch with what was current
+      branch.content = currentContent;
+      branch.usage = currentUsage;
+      if (msg.role === 'user' && branch.followUp) {
+        // Restore follow-up messages from the branch
+        conv.messages = conv.messages.slice(0, messageIndex + 1).concat(branch.followUp);
+        branch.followUp = currentFollowUp;
+      }
+    }
+
+    conv.updatedAt = Date.now();
+    saveState();
+    syncConversationToServer(conv);
+    renderChat();
+  }
+
+  // ═══════════════════════════════════════════════════
+  // PHASE 2: Export + Token Stats
+  // ═══════════════════════════════════════════════════
+
+  function exportConversation() {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv) {
+      showToast('No active conversation to export.');
+      return;
+    }
+
+    const date = new Date().toLocaleDateString();
+    let md = `# ${conv.title}\n`;
+    md += `*Exported from Claude Chat on ${date}*\n`;
+    md += `*Model: ${state.selectedModel || 'unknown'}*\n\n---\n\n`;
+
+    conv.messages.forEach(msg => {
+      const textContent = typeof msg.content === 'object' ? (msg.content.text || '') : (msg.content || '');
+      if (msg.role === 'user') {
+        md += `**You:** ${textContent}\n\n`;
+      } else {
+        md += `**Assistant:** ${textContent}\n\n---\n\n`;
+      }
+    });
+
+    // Download as .md file
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${conv.title.replace(/[^a-zA-Z0-9 ]/g, '').trim() || 'chat'}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('Conversation exported as Markdown.', 'success');
+  }
+
+  function updateConversationTokenDisplay() {
+    if (!inputHint) return;
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv) {
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images`;
+      return;
+    }
+
+    // Find the last assistant message with usage data — that represents
+    // the most recent API call. prompt_tokens already includes the full
+    // conversation history, so summing across turns would double/triple-count.
+    let lastTurnUsage = null;
+    let totalOutputTokens = 0;
+    let totalCost = 0;
+    for (let i = conv.messages.length - 1; i >= 0; i--) {
+      const msg = conv.messages[i];
+      if (msg.usage) {
+        if (!lastTurnUsage) lastTurnUsage = msg.usage;
+        totalOutputTokens += (msg.usage.completion_tokens || 0);
+        totalCost += estimateCost(msg.usage, state.selectedModel);
+      }
+    }
+
+    // Last turn tokens = prompt (context sent) + completion (generated)
+    const lastTurnTokens = lastTurnUsage
+      ? (lastTurnUsage.prompt_tokens || 0) + (lastTurnUsage.completion_tokens || 0)
+      : 0;
+
+    state.conversationTokens = lastTurnTokens;
+    state.conversationCost = totalCost;
+
+    if (lastTurnTokens > 0) {
+      const promptPart = (lastTurnUsage.prompt_tokens || 0).toLocaleString();
+      const outputPart = totalOutputTokens.toLocaleString();
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line &nbsp;|&nbsp; <span class="token-stats">${promptPart} ctx + ${outputPart} out (${formatCost(totalCost)})</span>`;
+    } else {
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images`;
+    }
+  }
+
+  function updateContextBar() {
+    if (!contextBarWrapper || !contextBarFill || !contextBarLabel) return;
+    const usage = calculateContextUsage();
+
+    // Show context bar only when there's meaningful usage
+    if (usage.totalTokens === 0) {
+      contextBarWrapper.classList.add('hidden');
+      return;
+    }
+    contextBarWrapper.classList.remove('hidden');
+
+    const pct = Math.min(usage.ratio * 100, 100);
+    contextBarFill.style.width = pct.toFixed(1) + '%';
+
+    // Color states
+    contextBarFill.classList.remove('context-warning', 'context-danger');
+    contextBarLabel.classList.remove('context-warning', 'context-danger');
+    if (usage.ratio >= CONTEXT_BLOCK) {
+      contextBarFill.classList.add('context-danger');
+      contextBarLabel.classList.add('context-danger');
+    } else if (usage.ratio >= CONTEXT_WARN) {
+      contextBarFill.classList.add('context-warning');
+      contextBarLabel.classList.add('context-warning');
+    }
+
+    contextBarLabel.textContent = `${formatTokenCount(usage.totalTokens)} / ${formatTokenCount(usage.windowSize)} (${pct.toFixed(0)}%)`;
+  }
+
+  // Debounce helper for context bar updates on input
+  let _contextBarTimer = null;
+  function debouncedUpdateContextBar() {
+    clearTimeout(_contextBarTimer);
+    _contextBarTimer = setTimeout(updateContextBar, 300);
+  }
+
+  // ─── Auto-truncation for context limits ──────────
+  function truncateConversationForContext(apiMessages, windowSize) {
+    // Helper: estimate tokens from a message's content, ignoring image data URLs
+    function msgTokens(m) {
+      const c = m.content;
+      if (typeof c === 'string') return estimateTokens(c);
+      if (Array.isArray(c)) {
+        // Multi-part content (text + images) — only count text parts
+        let t = 0;
+        c.forEach(part => {
+          if (part.type === 'text') t += estimateTokens(part.text);
+          else t += 85; // ~fixed overhead per image in API
+        });
+        return t;
+      }
+      if (c && typeof c === 'object' && c.text) return estimateTokens(c.text);
+      return 0;
+    }
+
+    // Calculate total tokens
+    let total = 0;
+    apiMessages.forEach(m => { total += msgTokens(m); });
+
+    if (total <= windowSize * CONTEXT_BLOCK) return apiMessages;
+
+    // Find system messages (always keep) and conversation messages
+    const systemMsgs = [];
+    const convMsgs = [];
+    apiMessages.forEach(m => {
+      if (m.role === 'system') systemMsgs.push(m);
+      else convMsgs.push(m);
+    });
+
+    let systemTokens = 0;
+    systemMsgs.forEach(m => { systemTokens += msgTokens(m); });
+
+    const targetTokens = Math.floor(windowSize * CONTEXT_WARN); // Aim for 80% after truncation
+    const availableForConv = targetTokens - systemTokens;
+
+    if (availableForConv <= 0) return apiMessages; // Can't truncate enough
+
+    // Keep messages from the end (newest), drop from beginning (oldest)
+    const kept = [];
+    let keptTokens = 0;
+    for (let i = convMsgs.length - 1; i >= 0; i--) {
+      const mt = msgTokens(convMsgs[i]);
+      if (keptTokens + mt > availableForConv && kept.length > 0) break;
+      kept.unshift(convMsgs[i]);
+      keptTokens += mt;
+    }
+
+    const trimmedCount = convMsgs.length - kept.length;
+    if (trimmedCount > 0) {
+      showToast(`${trimmedCount} older message(s) trimmed to fit context window.`, 'info');
+      const note = { role: 'system', content: `[Note: ${trimmedCount} older messages were trimmed to fit the context window.]` };
+      return [...systemMsgs, note, ...kept];
+    }
+
+    return apiMessages;
+  }
+
+  // ─── Send message ─────────────────────────────────
+  async function sendMessage(resendMode) {
+    const text = resendMode ? '' : chatInput.value.trim();
+    const images = resendMode ? [] : [...pendingImages];
+
+    if (!resendMode && !text && images.length === 0) return;
+    if (state.isStreaming) return;
 
     const model = modelSelector.value;
     if (!model) {
       showToast('Please select a model first.');
       return;
+    }
+
+    // Pre-send context validation
+    const preUsage = calculateContextUsage();
+    if (preUsage.ratio >= CONTEXT_BLOCK) {
+      showToast(`Context window is ${(preUsage.ratio * 100).toFixed(0)}% full (${formatTokenCount(preUsage.totalTokens)} / ${formatTokenCount(preUsage.windowSize)}). Please start a new conversation or remove knowledge files.`);
+      return;
+    }
+    if (preUsage.ratio >= CONTEXT_WARN) {
+      const proceed = confirm(
+        `Context window is ${(preUsage.ratio * 100).toFixed(0)}% full.\n\n` +
+        `System/Knowledge: ${formatTokenCount(preUsage.systemTokens)}\n` +
+        `Conversation: ${formatTokenCount(preUsage.conversationTokens)}\n` +
+        `Pending input: ${formatTokenCount(preUsage.pendingTokens)}\n` +
+        `Total: ${formatTokenCount(preUsage.totalTokens)} / ${formatTokenCount(preUsage.windowSize)}\n\n` +
+        `Continue sending?`
+      );
+      if (!proceed) return;
     }
 
     if (!state.activeConversationId || !state.conversations[state.activeConversationId]) {
@@ -964,34 +2005,43 @@
 
     const conv = state.conversations[state.activeConversationId];
 
-    const ws = chatMessages.querySelector('.welcome');
-    if (ws) ws.remove();
+    // If not resend mode, add the user message
+    if (!resendMode) {
+      const ws = chatMessages.querySelector('.welcome');
+      if (ws) ws.remove();
 
-    // Store message with images for display
-    const storageContent = (images.length > 0)
-      ? { text, images: images.map(img => ({ dataUrl: img.dataUrl, mimeType: img.mimeType })) }
-      : text;
+      const storageContent = (images.length > 0)
+        ? { text, images: images.map(img => ({ dataUrl: img.dataUrl, mimeType: img.mimeType })) }
+        : text;
 
-    conv.messages.push({ role: 'user', content: storageContent });
-    conv.updatedAt = Date.now();
-    autoTitle(conv.id, text || 'Image');
-    saveState();
-    syncConversationToServer(conv);
+      conv.messages.push({ role: 'user', content: storageContent });
+      conv.updatedAt = Date.now();
+      autoTitle(conv.id, text || 'Image');
+      saveState();
+      syncConversationToServer(conv);
 
-    chatMessages.appendChild(createMessageElement('user', storageContent));
-    chatInput.value = '';
-    pendingImages = [];
-    renderImagePreviews();
-    autoResize();
-    scrollToBottom();
+      chatMessages.appendChild(createMessageElement('user', storageContent, conv.messages.length - 1, conv.messages[conv.messages.length - 1]));
+      chatInput.value = '';
+      pendingImages = [];
+      renderImagePreviews();
+      autoResize();
+      scrollToBottom();
+    }
 
     const assistantDiv = document.createElement('div');
     assistantDiv.className = 'message assistant';
     assistantDiv.innerHTML = `
       <div class="message-wrapper">
         <div class="message-avatar">A</div>
-        <div class="message-content streaming-cursor">
-          <div class="typing-indicator"><span></span><span></span><span></span></div>
+        <div class="message-body">
+          <div class="message-content streaming-cursor">
+            <div class="typing-indicator"><span></span><span></span><span></span></div>
+          </div>
+          <div class="streaming-tokens" id="streamingTokenCounter">
+            <span class="streaming-dot"></span>
+            <span class="streaming-token-count">0 tokens</span>
+          </div>
+          </div>
         </div>
       </div>
     `;
@@ -1000,48 +2050,66 @@
 
     setStreaming(true);
     let fullResponse = '';
-    let fallbackChecked = false;  // Only check first chunk for fallback
+    let fallbackChecked = false;
+    let lastUsage = null;
 
     try {
       const abortController = new AbortController();
       state.abortController = abortController;
 
-      // Build API messages — convert stored format to OpenAI API format
-      const apiMessages = conv.messages.map(m => {
+      // Build API messages
+      const apiMessages = [];
+
+      // Inject system prompt from active project
+      const { text: sysText, images: sysImages } = getActiveProjectSystemPrompt();
+      if (sysText || sysImages.length > 0) {
+        if (sysImages.length > 0) {
+          // Build array-of-parts content for system message with images
+          const systemContent = [];
+          if (sysText) systemContent.push({ type: 'text', text: sysText });
+          sysImages.forEach(img => systemContent.push(img));
+          apiMessages.push({ role: 'system', content: systemContent });
+        } else {
+          apiMessages.push({ role: 'system', content: sysText });
+        }
+      }
+
+      conv.messages.forEach(m => {
         if (m.role === 'assistant') {
-          // Assistant messages are always plain text
           const t = (typeof m.content === 'object' && m.content !== null) ? m.content.text : m.content;
-          return { role: 'assistant', content: t || '' };
+          apiMessages.push({ role: 'assistant', content: t || '' });
+        } else {
+          if (typeof m.content === 'object' && m.content !== null && !Array.isArray(m.content) && m.content.images?.length > 0) {
+            apiMessages.push({ role: 'user', content: buildMessageContent(m.content.text, m.content.images) });
+          } else {
+            const t = (typeof m.content === 'object' && m.content !== null) ? m.content.text : m.content;
+            apiMessages.push({ role: 'user', content: t || '' });
+          }
         }
-        // User messages may have images
-        if (typeof m.content === 'object' && m.content !== null && !Array.isArray(m.content) && m.content.images?.length > 0) {
-          return {
-            role: 'user',
-            content: buildMessageContent(m.content.text, m.content.images),
-          };
-        }
-        const t = (typeof m.content === 'object' && m.content !== null) ? m.content.text : m.content;
-        return { role: 'user', content: t || '' };
       });
+
+      // Auto-truncate if approaching context limit
+      const windowSize = getContextWindowSize(model);
+      const truncatedMessages = truncateConversationForContext(apiMessages, windowSize);
 
       const res = await fetch(`${getProxyUrl()}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
-          messages: apiMessages,
+          messages: truncatedMessages,
           stream: true,
+          stream_options: { include_usage: true },
         }),
         signal: abortController.signal,
       });
 
       if (!res.ok) {
         const errBody = await res.text();
-        // Detect dead/unsupported models and remove them from the list
         if (res.status === 400 && /not supported|not available|does not exist/i.test(errBody)) {
           markModelDead(model);
           showToast(`Model "${model}" is no longer available. Removing from list.`);
-          loadModels(); // refresh the dropdown
+          loadModels();
         }
         throw new Error(`API error ${res.status}: ${errBody.slice(0, 200)}`);
       }
@@ -1050,6 +2118,7 @@
       const decoder = new TextDecoder();
       let buffer = '';
       const contentEl = assistantDiv.querySelector('.message-content');
+      const streamingCountEl = assistantDiv.querySelector('.streaming-token-count');
 
       while (true) {
         const { value, done } = await reader.read();
@@ -1068,7 +2137,7 @@
           try {
             const parsed = JSON.parse(data);
 
-            // ─── Fallback detection (first chunk only) ───
+            // Fallback detection (first chunk only)
             if (!fallbackChecked && parsed.model) {
               fallbackChecked = true;
               const fb = detectFallback(model, parsed.model);
@@ -1077,16 +2146,24 @@
               }
             }
 
+            // Extract usage from final chunk
+            if (parsed.usage) {
+              lastUsage = parsed.usage;
+            }
+
             const delta = parsed.choices?.[0]?.delta?.content;
             if (delta) {
               fullResponse += delta;
               contentEl.innerHTML = renderMarkdown(fullResponse);
               contentEl.classList.add('streaming-cursor');
+              // Update live token counter
+              if (streamingCountEl) {
+                const est = estimateTokens(fullResponse);
+                streamingCountEl.textContent = `~${est.toLocaleString()} tokens`;
+              }
               scrollToBottom();
             }
-          } catch (parseErr) {
-            // skip malformed chunks
-          }
+          } catch (parseErr) {}
         }
       }
     } catch (err) {
@@ -1103,14 +2180,26 @@
     contentEl.classList.remove('streaming-cursor');
     contentEl.innerHTML = renderMarkdown(fullResponse);
 
-    conv.messages.push({ role: 'assistant', content: fullResponse });
+    // Remove the live streaming counter (the re-render below adds the final token pill)
+    const streamCounter = assistantDiv.querySelector('.streaming-tokens');
+    if (streamCounter) streamCounter.remove();
+
+    const assistantMsg = { role: 'assistant', content: fullResponse };
+    if (lastUsage) {
+      assistantMsg.usage = lastUsage;
+    }
+    conv.messages.push(assistantMsg);
     conv.updatedAt = Date.now();
     saveState();
     syncConversationToServer(conv);
     setStreaming(false);
-    scrollToBottom();
 
-    // Refresh logs after a response to show the new request in the log panel
+    // Re-render to show action buttons, token info, etc.
+    renderChat();
+    scrollToBottom();
+    updateConversationTokenDisplay();
+    updateContextBar();
+
     if (state.logPanelOpen) {
       setTimeout(fetchLogs, 500);
     }
@@ -1241,11 +2330,8 @@
     logToggleBtn.classList.toggle('active', state.logPanelOpen);
 
     if (state.logPanelOpen) {
-      // Restore saved width
       const savedWidth = localStorage.getItem(LOG_WIDTH_KEY);
-      if (savedWidth) {
-        logPanel.style.width = savedWidth + 'px';
-      }
+      if (savedWidth) logPanel.style.width = savedWidth + 'px';
       fetchLogs();
       startLogPolling();
     } else {
@@ -1261,10 +2347,9 @@
     stopLogPolling();
   }
 
-  // ─── Log panel resize (drag handle) ────────────────
   function initLogResize() {
     const MIN_WIDTH = 280;
-    const MAX_RATIO = 0.7; // max 70% of viewport width
+    const MAX_RATIO = 0.7;
     let isDragging = false;
     let startX = 0;
     let startWidth = 0;
@@ -1281,7 +2366,6 @@
 
     document.addEventListener('mousemove', (e) => {
       if (!isDragging) return;
-      // Dragging left → panel grows; dragging right → panel shrinks
       const delta = startX - e.clientX;
       const maxWidth = window.innerWidth * MAX_RATIO;
       const newWidth = Math.min(maxWidth, Math.max(MIN_WIDTH, startWidth + delta));
@@ -1294,11 +2378,9 @@
       logResizeHandle.classList.remove('dragging');
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
-      // Persist width
       localStorage.setItem(LOG_WIDTH_KEY, logPanel.offsetWidth);
     });
 
-    // Double-click to reset to default 480px
     logResizeHandle.addEventListener('dblclick', () => {
       logPanel.style.width = '480px';
       localStorage.removeItem(LOG_WIDTH_KEY);
@@ -1322,13 +2404,9 @@
     }
   }
 
-  let logSelectionStartTime = 0;  // Timestamp when user first selected text in logs
-  const LOG_SELECTION_GRACE_MS = 10000; // 10 seconds to copy before logs resume
+  let logSelectionStartTime = 0;
+  const LOG_SELECTION_GRACE_MS = 10000;
 
-  /**
-   * Check if user has an active text selection in the log panel
-   * that should block DOM updates. Returns true if we should skip.
-   */
   function isLogSelectionActive() {
     const sel = window.getSelection();
     if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
@@ -1336,10 +2414,7 @@
       if (selNode && logPanelBody.contains(selNode)) {
         const now = Date.now();
         if (!logSelectionStartTime) logSelectionStartTime = now;
-        if (now - logSelectionStartTime < LOG_SELECTION_GRACE_MS) {
-          return true; // Within grace period — don't touch the DOM
-        }
-        // Grace period expired — clear selection and resume
+        if (now - logSelectionStartTime < LOG_SELECTION_GRACE_MS) return true;
         sel.removeAllRanges();
         logSelectionStartTime = 0;
         return false;
@@ -1351,9 +2426,7 @@
 
   async function fetchLogs() {
     try {
-      // Early check — skip entire fetch if selection is active
       if (isLogSelectionActive()) return;
-
       const level = logLevelFilter.value || 'all';
       const filter = logSearch.value || '';
       const source = logSourceSelector ? logSourceSelector.value : 'proxy';
@@ -1368,10 +2441,8 @@
         return;
       }
 
-      // Update file info
       logFileInfo.textContent = `${data.file}  |  ${data.total} total lines  |  ${data.filtered} shown`;
 
-      // Count errors for badge
       const errorCount = data.lines.filter(l => l.level === 'error').length;
       state.logErrorCount = errorCount;
       if (errorCount > 0) {
@@ -1381,7 +2452,6 @@
         logErrorBadge.classList.add('hidden');
       }
 
-      // Render log lines — re-check selection after async fetch (race condition guard)
       if (isLogSelectionActive()) return;
 
       const shouldScroll = logAutoScroll.checked;
@@ -1402,11 +2472,9 @@
       });
       logPanelBody.appendChild(fragment);
 
-      // Auto-scroll to bottom
       if (shouldScroll || wasAtBottom) {
         logPanelBody.scrollTop = logPanelBody.scrollHeight;
       }
-
     } catch (e) {
       console.warn('Failed to fetch logs:', e);
       logPanelBody.innerHTML = `<div class="log-empty">Cannot fetch logs. Make sure you're running server.py<br><br><code>python server.py</code></div>`;
@@ -1422,7 +2490,7 @@
       const res = await fetch(`${getServerUrl()}/api/logs/clear?${params}`);
       if (res.ok) {
         fetchLogs();
-        showToast(`${label} logs cleared.`);
+        showToast(`${label} logs cleared.`, 'success');
       }
     } catch (e) {
       showToast('Failed to clear logs.');
@@ -1451,24 +2519,18 @@
     return el.innerHTML;
   }
 
-  function showToast(message) {
-    const existing = document.querySelector('.error-toast');
+  function showToast(message, type = 'error') {
+    const existing = document.querySelector('.toast');
     if (existing) existing.remove();
     const toast = document.createElement('div');
-    toast.className = 'error-toast';
+    toast.className = 'toast toast-' + type;
     toast.textContent = message;
     document.body.appendChild(toast);
     setTimeout(() => toast.remove(), 5000);
   }
 
-  /**
-   * Show a fallback notice inline next to the model dropdown.
-   * Stays visible until dismissed or model is changed.
-   */
   function showFallbackNotice(assistantDiv, requestedId, requestedLabel, actualLabel) {
-    // Remove any existing fallback notice
     clearFallbackNotice();
-
     const notice = document.createElement('div');
     notice.className = 'fallback-notice';
     notice.id = 'fallbackNotice';
@@ -1482,12 +2544,8 @@
       <button class="fallback-dismiss" title="Dismiss">&times;</button>
     `;
     notice.querySelector('.fallback-dismiss').addEventListener('click', () => clearFallbackNotice());
-
-    // Insert right after the model selector wrapper in the topbar
     const wrapper = document.querySelector('.model-selector-wrapper');
-    if (wrapper) {
-      wrapper.parentNode.insertBefore(notice, wrapper.nextSibling);
-    }
+    if (wrapper) wrapper.parentNode.insertBefore(notice, wrapper.nextSibling);
   }
 
   function clearFallbackNotice() {
@@ -1532,12 +2590,13 @@
   // ─── Event binding ────────────────────────────────
   function bindEvents() {
     newChatBtn.addEventListener('click', () => createConversation());
-    sendBtn.addEventListener('click', sendMessage);
+    sendBtn.addEventListener('click', () => sendMessage());
     stopBtn.addEventListener('click', stopStreaming);
 
     chatInput.addEventListener('input', () => {
       autoResize();
       updateSendButton();
+      debouncedUpdateContextBar();
     });
 
     chatInput.addEventListener('keydown', (e) => {
@@ -1547,20 +2606,15 @@
       }
     });
 
-    // Image paste support
     chatInput.addEventListener('paste', handlePaste);
 
-    // Also support paste anywhere in the main area (e.g., user clicks outside textarea)
     document.addEventListener('paste', (e) => {
-      // Skip if the event already came from the chatInput (avoid double-paste)
       if (e.target === chatInput) return;
-      // Only handle if no dialog is open and not focused on another input
       const activeEl = document.activeElement;
       if (activeEl && activeEl !== chatInput && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) return;
       handlePaste(e);
     });
 
-    // Drag and drop images
     const inputContainer = chatInput.closest('.input-container');
     inputContainer.addEventListener('dragover', (e) => { e.preventDefault(); inputContainer.style.borderColor = 'var(--accent)'; });
     inputContainer.addEventListener('dragleave', () => { inputContainer.style.borderColor = ''; });
@@ -1570,6 +2624,7 @@
       state.selectedModel = modelSelector.value;
       localStorage.setItem(MODEL_KEY, state.selectedModel);
       clearFallbackNotice();
+      updateContextBar();
     });
 
     themeToggle.addEventListener('click', toggleTheme);
@@ -1607,10 +2662,57 @@
     renameDialog.addEventListener('click', (e) => { if (e.target === renameDialog) hideRenameDialog(); });
     deleteDialog.addEventListener('click', (e) => { if (e.target === deleteDialog) hideDeleteDialog(); });
 
+    // Project events
+    if (projectSelect) {
+      projectSelect.addEventListener('change', () => {
+        switchProject(projectSelect.value);
+      });
+    }
+    if (projectSettingsBtn) {
+      projectSettingsBtn.addEventListener('click', () => {
+        if (state.activeProjectId) {
+          showProjectDialog(state.activeProjectId);
+        }
+      });
+    }
+    if (projectAddBtn) {
+      projectAddBtn.addEventListener('click', () => showProjectDialog(null));
+    }
+    if (projectSaveBtn) {
+      projectSaveBtn.addEventListener('click', saveProject);
+    }
+    if (projectCancelBtn) {
+      projectCancelBtn.addEventListener('click', hideProjectDialog);
+    }
+    if (projectDeleteBtn) {
+      projectDeleteBtn.addEventListener('click', deleteProject);
+    }
+    if (knowledgeAddBtn) {
+      knowledgeAddBtn.addEventListener('click', addKnowledgeFile);
+    }
+    if (projectDialog) {
+      projectDialog.addEventListener('click', (e) => { if (e.target === projectDialog) hideProjectDialog(); });
+    }
+
+    // Sidebar search
+    if (sidebarSearchInput) {
+      let searchTimeout;
+      sidebarSearchInput.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(renderConversationList, 200);
+      });
+    }
+
+    // Export button
+    if (exportBtn) {
+      exportBtn.addEventListener('click', exportConversation);
+    }
+
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         if (!renameDialog.classList.contains('hidden')) hideRenameDialog();
         if (!deleteDialog.classList.contains('hidden')) hideDeleteDialog();
+        if (projectDialog && !projectDialog.classList.contains('hidden')) hideProjectDialog();
         if (state.logPanelOpen) closeLogPanel();
       }
     });
@@ -1623,27 +2725,30 @@
       });
     });
 
-    // Ctrl+Shift+N for new chat
+    // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
         e.preventDefault();
         createConversation();
       }
-      // Ctrl+L to toggle log panel
       if ((e.ctrlKey || e.metaKey) && e.key === 'l') {
         e.preventDefault();
         toggleLogPanel();
       }
+      // Ctrl+Shift+E to export
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'E') {
+        e.preventDefault();
+        exportConversation();
+      }
     });
 
-    // ── Log panel events ──
+    // Log panel events
     logToggleBtn.addEventListener('click', toggleLogPanel);
     logCloseBtn.addEventListener('click', closeLogPanel);
     logPopoutBtn.addEventListener('click', popoutLogs);
     logRefreshBtn.addEventListener('click', fetchLogs);
     logClearBtn.addEventListener('click', clearLogs);
 
-    // Re-fetch logs when filter/level/source changes
     let logSearchTimeout;
     logSearch.addEventListener('input', () => {
       clearTimeout(logSearchTimeout);
