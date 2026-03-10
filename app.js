@@ -2323,7 +2323,7 @@
                 const est = estimateTokens(fullResponse);
                 streamingCountEl.textContent = `~${est.toLocaleString()} tokens`;
               }
-              scrollToBottom();
+              scrollToBottom(false);   // don't force — respect user's scroll position
             }
           } catch (parseErr) {}
         }
@@ -2358,11 +2358,12 @@
     conv.updatedAt = Date.now();
     saveState();
     syncConversationToServer(conv);
+    const wasScrolledUp = _userScrolledUp;   // capture before setStreaming resets it
     setStreaming(false);
 
     // Re-render to show action buttons, token info, etc.
     renderChat();
-    scrollToBottom();
+    scrollToBottom(!wasScrolledUp);          // only force-scroll if user was following along
     updateConversationTokenDisplay();
     updateContextBar();
 
@@ -2376,11 +2377,13 @@
     state.isStreaming = active;
     sendBtn.classList.toggle('hidden', active);
     stopBtn.classList.toggle('hidden', !active);
-    chatInput.disabled = active;
-    if (!active) {
+    // Don't disable the input — let users type their next message while streaming
+    if (active) {
+      _userScrolledUp = false;   // reset — new response starts at the bottom
+    } else {
       chatInput.focus();
-      updateSendButton();
     }
+    updateSendButton();
   }
 
   function stopStreaming() {
@@ -2663,7 +2666,32 @@
   }
 
   // ─── UI Helpers ───────────────────────────────────
-  function scrollToBottom() {
+
+  // Track whether the user has deliberately scrolled away from the bottom.
+  // When true, streaming chunks will NOT auto-scroll so the user can read
+  // earlier messages in peace.
+  let _userScrolledUp = false;
+  const SCROLL_NEAR_BOTTOM_PX = 150;
+
+  function isUserNearBottom() {
+    const { scrollTop, scrollHeight, clientHeight } = chatContainer;
+    return scrollHeight - scrollTop - clientHeight < SCROLL_NEAR_BOTTOM_PX;
+  }
+
+  // Listen for manual scroll on the chat container
+  chatContainer.addEventListener('scroll', () => {
+    if (!state.isStreaming) return;          // only matters during streaming
+    _userScrolledUp = !isUserNearBottom();
+  });
+
+  /**
+   * Scroll the chat to the bottom.
+   * @param {boolean} force  If true, always scroll (e.g. user sent a message,
+   *                         loaded a conversation). If false, only scroll when
+   *                         the user hasn't scrolled up to read earlier messages.
+   */
+  function scrollToBottom(force = true) {
+    if (!force && _userScrolledUp) return;   // respect the user's scroll position
     requestAnimationFrame(() => {
       chatContainer.scrollTop = chatContainer.scrollHeight;
     });
@@ -2675,7 +2703,7 @@
   }
 
   function updateSendButton() {
-    sendBtn.disabled = !chatInput.value.trim() && pendingImages.length === 0;
+    sendBtn.disabled = state.isStreaming || (!chatInput.value.trim() && pendingImages.length === 0);
   }
 
   function escapeHtml(str) {
