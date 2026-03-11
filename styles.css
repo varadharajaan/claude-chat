@@ -425,7 +425,7 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  min-width: 360px;
   overflow: hidden;
 }
 
@@ -591,12 +591,20 @@ body {
 }
 
 .chat-messages {
-  max-width: 800px;
+  max-width: 900px;
   margin: 0 auto;
-  padding: 20px 24px;
+  padding: 20px 32px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* When a side panel is open, let messages and input fill the available space */
+.chat-column.panel-open .chat-messages,
+.chat-column.panel-open .input-container,
+.chat-column.panel-open .input-hint,
+.chat-column.panel-open .context-bar-wrapper {
+  max-width: 100%;
 }
 
 /* Welcome screen */
@@ -674,6 +682,7 @@ body {
   display: flex;
   gap: 14px;
   align-items: flex-start;
+  position: relative;
 }
 
 .message-avatar {
@@ -883,7 +892,7 @@ body {
 }
 
 .input-container {
-  max-width: 800px;
+  max-width: 900px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1063,7 +1072,7 @@ body {
   font-size: 0.72rem;
   color: var(--text-muted);
   margin-top: 6px;
-  max-width: 800px;
+  max-width: 900px;
   margin-left: auto;
   margin-right: auto;
 }
@@ -1073,7 +1082,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 800px;
+  max-width: 900px;
   margin: 4px auto 0;
   padding: 0 4px;
 }
@@ -1728,6 +1737,181 @@ kbd {
 }
 
 /* =====================================================
+   Artifact Panel (code side viewer — like Claude.ai)
+   ===================================================== */
+
+.artifact-resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 51;
+  transition: background 0.15s;
+}
+.artifact-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 40px;
+  border-radius: 3px;
+  background: var(--border);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.artifact-resize-handle:hover,
+.artifact-resize-handle.dragging {
+  background: var(--accent-subtle);
+}
+.artifact-resize-handle:hover::after,
+.artifact-resize-handle.dragging::after {
+  opacity: 1;
+  background: var(--accent);
+}
+
+.artifact-panel {
+  width: 45%;
+  min-width: 320px;
+  max-width: 60vw;
+  background: var(--sidebar-bg);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+  animation: slideInRight 0.2s ease;
+  flex-shrink: 0;
+}
+
+.artifact-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  min-height: 44px;
+}
+
+.artifact-lang {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+.artifact-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.artifact-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-family: inherit;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.artifact-action-btn:hover {
+  color: var(--text);
+  background: var(--sidebar-hover);
+  border-color: var(--border);
+}
+.artifact-action-btn.active {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.artifact-panel-body {
+  flex: 1;
+  overflow: auto;
+  background: var(--code-bg);
+  min-width: 0;
+  min-height: 0;
+}
+
+.artifact-pre {
+  margin: 0;
+  padding: 20px 24px;
+  min-height: 100%;
+  width: fit-content;
+  min-width: 100%;
+  white-space: pre;
+  overflow: visible;
+}
+
+.artifact-code {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', 'Monaco', monospace;
+  font-size: 0.82rem;
+  line-height: 1.65;
+  color: var(--code-text);
+  white-space: pre;
+  display: block;
+  tab-size: 4;
+  overflow: visible;
+}
+
+.artifact-code.wrap-enabled {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* "Open in panel" button in code block headers */
+.code-open-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+}
+.code-open-btn:hover {
+  color: var(--accent);
+  background: var(--sidebar-hover);
+}
+
+/* Highlight the code block that is currently opened in the artifact panel */
+.code-block.artifact-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-subtle);
+}
+
+@media (max-width: 768px) {
+  .artifact-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100% !important;
+    min-width: 0;
+  }
+  .artifact-resize-handle {
+    display: none !important;
+  }
+}
+
+/* =====================================================
    Phase 1: Projects + System Prompts
    ===================================================== */
 
@@ -2286,6 +2470,54 @@ kbd {
   color: var(--accent);
 }
 
+/* --- Floating export bar — top-right of each message on hover --- */
+
+.msg-export-bar {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  z-index: 10;
+}
+
+.message:hover .msg-export-bar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg-export-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  border-radius: 8px;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0,0,0,.1);
+  transition: color 0.12s, background 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+
+.msg-export-btn:hover {
+  color: var(--accent);
+  background: var(--sidebar-hover);
+  border-color: var(--accent);
+  box-shadow: 0 2px 12px rgba(0,0,0,.15);
+}
+
+.msg-export-btn:active {
+  transform: scale(0.96);
+}
+
 /* --- Edit Mode --- */
 .message.edit-mode .message-content {
   display: none;
@@ -2419,6 +2651,12 @@ kbd {
   /* Message actions always visible on touch devices */
   .message-actions {
     opacity: 1;
+  }
+
+  /* Export bar always visible on touch devices */
+  .msg-export-bar {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   /* Export button hides text */

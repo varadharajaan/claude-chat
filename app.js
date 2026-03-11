@@ -169,6 +169,7 @@
   const conversationList = $('#conversationList');
   const chatContainer = $('#chatContainer');
   const chatMessages = $('#chatMessages');
+  const chatColumn = $('.chat-column');
   const chatInput = $('#chatInput');
   const sendBtn = $('#sendBtn');
   const stopBtn = $('#stopBtn');
@@ -198,6 +199,16 @@
   const logPanelBody = $('#logPanelBody');
   const logFileInfo = $('#logFileInfo');
   const logResizeHandle = $('#logResizeHandle');
+
+  // Artifact panel refs
+  const artifactPanel = $('#artifactPanel');
+  const artifactResizeHandle = $('#artifactResizeHandle');
+  const artifactLang = $('#artifactLang');
+  const artifactCode = $('#artifactCode');
+  const artifactCopyBtn = $('#artifactCopyBtn');
+  const artifactCloseBtn = $('#artifactCloseBtn');
+  const artifactWrapBtn = $('#artifactWrapBtn');
+  const ARTIFACT_WIDTH_KEY = 'claude-chat-artifact-width';
 
   // Proxy health refs
   const proxyStatusDot = $('#proxyStatusDot');
@@ -413,6 +424,7 @@
     autoResize();
     checkProxyHealth(true);
     initLogResize();
+    initArtifactResize();
 
     const hasLocal = Object.keys(state.conversations).length > 0;
     if (!hasLocal) {
@@ -1564,7 +1576,7 @@
   }
 
   // ─── Render chat ──────────────────────────────────
-  function renderChat() {
+  function renderChat(skipScroll) {
     chatMessages.innerHTML = '';
     const conv = state.conversations[state.activeConversationId];
 
@@ -1577,7 +1589,7 @@
       chatMessages.appendChild(createMessageElement(msg.role, msg.content, idx, msg));
     });
 
-    scrollToBottom();
+    if (!skipScroll) scrollToBottom();
     updateContextBar();
   }
 
@@ -1695,6 +1707,21 @@
 
     // Action buttons for messages
     let actionsHtml = '';
+
+    // Floating export bar — appears top-right of the message on hover
+    const exportBar = `
+      <div class="msg-export-bar" data-msg-index="${messageIndex}">
+        <button class="msg-export-btn" data-format="html" data-msg-index="${messageIndex}" title="Download as HTML">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+          HTML
+        </button>
+        <button class="msg-export-btn" data-format="pdf" data-msg-index="${messageIndex}" title="Save as PDF">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          PDF
+        </button>
+      </div>
+    `;
+
     if (role === 'user') {
       actionsHtml = `
         <div class="message-actions">
@@ -1733,6 +1760,7 @@
 
     div.innerHTML = `
       <div class="message-wrapper">
+        ${exportBar}
         <div class="message-avatar">${avatar}</div>
         <div class="message-body">
           <div class="message-content">${imagesHtml}${renderedContent}</div>
@@ -1772,6 +1800,15 @@
     const nextBtn = div.querySelector('.branch-next');
     if (prevBtn) prevBtn.addEventListener('click', () => switchBranch(messageIndex, -1));
     if (nextBtn) nextBtn.addEventListener('click', () => switchBranch(messageIndex, 1));
+
+    // Export message buttons
+    div.querySelectorAll('.msg-export-btn').forEach(optBtn => {
+      optBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const format = optBtn.dataset.format;
+        exportSingleMessage(messageIndex, format);
+      });
+    });
 
     // Token pill toggle
     const pill = div.querySelector('.token-pill');
@@ -1986,6 +2023,115 @@
     a.click();
     URL.revokeObjectURL(url);
     showToast('Conversation exported as Markdown.', 'success');
+  }
+
+  // ─── Export single message as HTML or PDF ────────
+  function exportSingleMessage(messageIndex, format) {
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv || !conv.messages[messageIndex]) {
+      showToast('Message not found.');
+      return;
+    }
+
+    const msg = conv.messages[messageIndex];
+    const textContent = typeof msg.content === 'object' ? (msg.content.text || '') : (msg.content || '');
+    const images = (typeof msg.content === 'object' && msg.content.images) ? msg.content.images : [];
+    const renderedContent = msg.role === 'user' ? escapeHtml(textContent).replace(/\n/g, '<br>') : renderMarkdown(textContent);
+    const roleLabel = msg.role === 'user' ? 'You' : 'Assistant';
+    const date = new Date().toLocaleDateString();
+    const title = conv.title || 'Chat Message';
+
+    // Build images HTML
+    let imagesHtml = '';
+    if (images.length > 0) {
+      imagesHtml = images.map(img => `<div style="margin:8px 0"><img src="${img.dataUrl}" style="max-width:100%;border-radius:8px" alt="Image"></div>`).join('');
+    }
+
+    const htmlContent = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(title)} — ${roleLabel}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    line-height: 1.6; color: #1a1a2e; background: #f8f9fa;
+    padding: 2rem; max-width: 800px; margin: 0 auto;
+  }
+  .header {
+    border-bottom: 2px solid #e2e8f0; padding-bottom: 1rem; margin-bottom: 1.5rem;
+  }
+  .header h1 { font-size: 1.4rem; color: #2d3748; }
+  .header .meta { font-size: 0.85rem; color: #718096; margin-top: 4px; }
+  .role-badge {
+    display: inline-block; padding: 2px 10px; border-radius: 12px;
+    font-size: 0.8rem; font-weight: 600; margin-bottom: 12px;
+  }
+  .role-user { background: #ebf8ff; color: #2b6cb0; }
+  .role-assistant { background: #f0fff4; color: #276749; }
+  .content {
+    background: white; border: 1px solid #e2e8f0; border-radius: 12px;
+    padding: 1.5rem; line-height: 1.7;
+  }
+  .content pre {
+    background: #1a1a2e; color: #e2e8f0; padding: 1rem; border-radius: 8px;
+    overflow-x: auto; font-size: 0.9rem; margin: 12px 0;
+  }
+  .content code {
+    background: #edf2f7; padding: 2px 6px; border-radius: 4px; font-size: 0.9em;
+  }
+  .content pre code { background: none; padding: 0; }
+  .content p { margin: 8px 0; }
+  .content ul, .content ol { margin: 8px 0 8px 1.5rem; }
+  .footer {
+    margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #e2e8f0;
+    font-size: 0.75rem; color: #a0aec0; text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>${escapeHtml(title)}</h1>
+    <div class="meta">Exported on ${date}</div>
+  </div>
+  <span class="role-badge role-${msg.role}">${roleLabel}</span>
+  <div class="content">${imagesHtml}${renderedContent}</div>
+  <div class="footer">Exported from Claude Chat</div>
+</body>
+</html>`;
+
+    if (format === 'html') {
+      const blob = new Blob([htmlContent], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${title.replace(/[^a-zA-Z0-9 ]/g, '').trim() || 'message'}-${roleLabel.toLowerCase()}.html`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Message exported as HTML.', 'success');
+    } else if (format === 'pdf') {
+      // Open in a new window and trigger print (Save as PDF)
+      const printWin = window.open('', '_blank');
+      if (!printWin) {
+        showToast('Pop-up blocked — please allow pop-ups for PDF export.');
+        return;
+      }
+      printWin.document.write(htmlContent);
+      printWin.document.close();
+      // Give the browser a moment to render, then trigger print dialog
+      setTimeout(() => {
+        printWin.print();
+        // Close the popup after the print dialog is dismissed
+        printWin.onafterprint = () => printWin.close();
+        // Fallback: close after a short delay if onafterprint isn't supported
+        setTimeout(() => {
+          if (!printWin.closed) printWin.close();
+        }, 60000);
+      }, 400);
+      showToast('PDF print dialog opened — choose "Save as PDF".', 'success');
+    }
   }
 
   function updateConversationTokenDisplay() {
@@ -2362,7 +2508,8 @@
     setStreaming(false);
 
     // Re-render to show action buttons, token info, etc.
-    renderChat();
+    // Skip auto-scroll inside renderChat — we handle it below based on user's scroll position
+    renderChat(true);
     scrollToBottom(!wasScrolledUp);          // only force-scroll if user was following along
     updateConversationTokenDisplay();
     updateContextBar();
@@ -2412,13 +2559,22 @@
       return `<div class="code-block">
         <div class="code-block-header">
           <span class="code-block-lang">${escapeHtml(block.lang)}</span>
-          <button class="code-copy-btn" onclick="window.__copyCode(this)">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-            </svg>
-            Copy
-          </button>
+          <div style="display:flex;gap:4px;align-items:center">
+            <button class="code-open-btn" onclick="window.__openArtifact(this)" title="Open in side panel">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <line x1="12" y1="3" x2="12" y2="21"/>
+              </svg>
+              Open
+            </button>
+            <button class="code-copy-btn" onclick="window.__copyCode(this)">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+              Copy
+            </button>
+          </div>
         </div>
         <div class="code-block-body"><code class="code-block-code">${escapedCode}</code></div>
       </div>`;
@@ -2491,6 +2647,108 @@
     });
   };
 
+  // ─── Panel-open class sync ──────────────────────
+  // Adds/removes .panel-open on .chat-column so CSS can expand content when a side panel is active
+  function syncPanelOpenClass() {
+    const anyOpen = _artifactOpen || state.logPanelOpen;
+    chatColumn.classList.toggle('panel-open', anyOpen);
+  }
+
+  // ─── Artifact Panel (code side viewer) ──────────
+  let _artifactOpen = false;
+
+  window.__openArtifact = function (btn) {
+    const codeBlock = btn.closest('.code-block');
+    const codeEl = codeBlock.querySelector('.code-block-code');
+    const langEl = codeBlock.querySelector('.code-block-lang');
+    // Get the raw text — use innerText to preserve visible line breaks
+    const codeText = codeEl.innerText || codeEl.textContent;
+    const lang = langEl ? langEl.textContent.trim() : 'CODE';
+    openArtifact(codeText, lang, codeBlock);
+  };
+
+  function openArtifact(codeText, lang, sourceBlock) {
+    // Remove previous highlight
+    document.querySelectorAll('.code-block.artifact-active').forEach(el => {
+      el.classList.remove('artifact-active');
+    });
+
+    // Highlight the source code block
+    if (sourceBlock) sourceBlock.classList.add('artifact-active');
+
+    // Populate the panel — use innerHTML with escaped text to preserve exact formatting
+    artifactLang.textContent = lang.toUpperCase();
+    artifactCode.innerHTML = escapeHtml(codeText);
+
+    // Always start with wrap OFF — preserves ASCII art, tables, formatted text
+    artifactCode.classList.remove('wrap-enabled');
+    artifactWrapBtn.classList.remove('active');
+
+    // Show the panel
+    artifactPanel.classList.remove('hidden');
+    artifactResizeHandle.classList.remove('hidden');
+    _artifactOpen = true;
+
+    // Restore saved width
+    const savedWidth = localStorage.getItem(ARTIFACT_WIDTH_KEY);
+    if (savedWidth) artifactPanel.style.width = savedWidth + 'px';
+
+    syncPanelOpenClass();
+  }
+
+  function closeArtifact() {
+    artifactPanel.classList.add('hidden');
+    artifactResizeHandle.classList.add('hidden');
+    _artifactOpen = false;
+    syncPanelOpenClass();
+
+    // Remove highlight from code blocks
+    document.querySelectorAll('.code-block.artifact-active').forEach(el => {
+      el.classList.remove('artifact-active');
+    });
+  }
+
+  function initArtifactResize() {
+    const MIN_WIDTH = 320;
+    const MAX_RATIO = 0.6;   // Max 60% of viewport (leaves room for sidebar + chat)
+    let isDragging = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    artifactResizeHandle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      isDragging = true;
+      startX = e.clientX;
+      startWidth = artifactPanel.offsetWidth;
+      artifactResizeHandle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      const delta = startX - e.clientX;
+      const maxWidth = window.innerWidth * MAX_RATIO;
+      const newWidth = Math.min(maxWidth, Math.max(MIN_WIDTH, startWidth + delta));
+      artifactPanel.style.width = newWidth + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!isDragging) return;
+      isDragging = false;
+      artifactResizeHandle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem(ARTIFACT_WIDTH_KEY, artifactPanel.offsetWidth);
+    });
+
+    // Double-click to reset to default width (45%)
+    artifactResizeHandle.addEventListener('dblclick', () => {
+      artifactPanel.style.width = '45%';
+      localStorage.removeItem(ARTIFACT_WIDTH_KEY);
+    });
+  }
+
   // ─── Log Panel ────────────────────────────────────
   function toggleLogPanel() {
     state.logPanelOpen = !state.logPanelOpen;
@@ -2506,6 +2764,7 @@
     } else {
       stopLogPolling();
     }
+    syncPanelOpenClass();
   }
 
   function closeLogPanel() {
@@ -2514,6 +2773,7 @@
     logResizeHandle.classList.add('hidden');
     logToggleBtn.classList.remove('active');
     stopLogPolling();
+    syncPanelOpenClass();
   }
 
   function initLogResize() {
@@ -2948,6 +3208,7 @@
         if (!renameDialog.classList.contains('hidden')) hideRenameDialog();
         if (!deleteDialog.classList.contains('hidden')) hideDeleteDialog();
         if (projectDialog && !projectDialog.classList.contains('hidden')) hideProjectDialog();
+        if (_artifactOpen) closeArtifact();
         if (state.logPanelOpen) closeLogPanel();
       }
     });
@@ -2998,6 +3259,33 @@
     logPanelBody.addEventListener('scroll', () => {
       const atBottom = logPanelBody.scrollTop + logPanelBody.clientHeight >= logPanelBody.scrollHeight - 20;
       logAutoScroll.checked = atBottom;
+    });
+
+    // Artifact panel events
+    artifactCloseBtn.addEventListener('click', closeArtifact);
+
+    artifactCopyBtn.addEventListener('click', () => {
+      const text = artifactCode.innerText || artifactCode.textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        artifactCopyBtn.innerHTML = `
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          Copied!
+        `;
+        setTimeout(() => {
+          artifactCopyBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+            Copy
+          `;
+        }, 2000);
+      });
+    });
+
+    artifactWrapBtn.addEventListener('click', () => {
+      artifactCode.classList.toggle('wrap-enabled');
+      artifactWrapBtn.classList.toggle('active');
     });
   }
 

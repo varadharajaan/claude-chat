@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Claude Chat</title>
-  <link rel="stylesheet" href="styles.css?v=10">
+  <link rel="stylesheet" href="styles.css?v=13">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
 </head>
 <body>
@@ -266,6 +266,37 @@
         </div>
       </div>
 
+      <!-- Artifact side panel (code viewer — like Claude.ai) -->
+      <div class="artifact-resize-handle hidden" id="artifactResizeHandle"></div>
+      <div class="artifact-panel hidden" id="artifactPanel">
+        <div class="artifact-panel-header">
+          <span class="artifact-lang" id="artifactLang">CODE</span>
+          <div class="artifact-controls">
+            <button class="artifact-action-btn" id="artifactWrapBtn" title="Toggle word wrap">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4"/><polyline points="13 16 10 19 13 22"/>
+              </svg>
+              Wrap
+            </button>
+            <button class="artifact-action-btn" id="artifactCopyBtn" title="Copy code">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+              Copy
+            </button>
+            <button class="artifact-action-btn" id="artifactCloseBtn" title="Close panel">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="artifact-panel-body" id="artifactPanelBody">
+          <pre class="artifact-pre"><code class="artifact-code" id="artifactCode"></code></pre>
+        </div>
+      </div>
+
     </div><!-- /main-content-area -->
   </main>
 
@@ -344,6 +375,6 @@
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
   </script>
-  <script src="app.js?v=10"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>
