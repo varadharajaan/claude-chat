@@ -15,6 +15,8 @@
   const EFFORT_KEY = 'claude-chat-effort';
   const PROXY_KEY = 'claude-chat-proxy';
   const PROJECT_KEY = 'claude-chat-active-project';
+  const TOTAL_COST_KEY = 'claude-chat-total-cost';
+  const COST_HISTORY_KEY = 'claude-chat-cost-history';
 
   // ─── Effort level ─────────────────────────────────
   // Mirrors Claude Code CLI's /model effort slider (low / medium / high).
@@ -251,6 +253,7 @@
   let pendingRenameId = null;
   let pendingDeleteId = null;
   let pendingImages = []; // Array of { dataUrl, mimeType } for images pasted before sending
+  let pendingFiles = [];  // Array of { name, content (text), type } for document attachments
   let editingProjectId = null; // Track which project we're editing in the dialog
   let projectKnowledgeFiles = []; // Temp storage for knowledge files in dialog
 
@@ -1517,7 +1520,68 @@
     for (const file of files) {
       if (file.type.startsWith('image/')) {
         readImageFile(file);
+      } else {
+        handleFileAttachment(file);
       }
+    }
+  }
+
+  async function handleFileAttachment(file) {
+    const name = file.name.toLowerCase();
+    const isPdf = name.endsWith('.pdf');
+    const isDocx = name.endsWith('.docx');
+    const isText = name.match(/\.(txt|md|json|csv|xml|html|py|js|ts|java|c|cpp|h|css|yaml|yml|toml|ini|cfg|log|sql|sh|rb|go|rs|swift|kt)$/);
+
+    if (isPdf) {
+      if (!window.pdfjsLib) {
+        showToast('PDF support requires pdf.js to be loaded.');
+        return;
+      }
+      showToast('Extracting PDF text...', 'success');
+      try {
+        const text = await extractPdfText(file);
+        if (!text || text.trim().length === 0) {
+          showToast('PDF has no extractable text (may be scanned/image-only).');
+          return;
+        }
+        pendingFiles.push({ name: file.name, content: text, type: 'pdf' });
+        renderImagePreviews();
+        updateSendButton();
+        showToast(`PDF "${file.name}" attached.`, 'success');
+      } catch (err) {
+        showToast(`Failed to read PDF: ${err.message}`);
+      }
+    } else if (isDocx) {
+      if (!window.mammoth) {
+        showToast('DOCX support requires mammoth.js to be loaded.');
+        return;
+      }
+      showToast('Extracting DOCX text...', 'success');
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        if (!result.value || result.value.trim().length === 0) {
+          showToast('DOCX has no extractable text.');
+          return;
+        }
+        pendingFiles.push({ name: file.name, content: result.value, type: 'docx' });
+        renderImagePreviews();
+        updateSendButton();
+        showToast(`DOCX "${file.name}" attached.`, 'success');
+      } catch (err) {
+        showToast(`Failed to read DOCX: ${err.message}`);
+      }
+    } else if (isText || file.type.startsWith('text/')) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        pendingFiles.push({ name: file.name, content: ev.target.result, type: 'text' });
+        renderImagePreviews();
+        updateSendButton();
+        showToast(`File "${file.name}" attached.`, 'success');
+      };
+      reader.readAsText(file);
+    } else {
+      showToast(`Unsupported file type: ${file.name}. Supported: PDF, DOCX, TXT, code files, images.`);
     }
   }
 
@@ -1541,7 +1605,7 @@
 
   function renderImagePreviews() {
     imagePreviewArea.innerHTML = '';
-    if (pendingImages.length === 0) {
+    if (pendingImages.length === 0 && pendingFiles.length === 0) {
       imagePreviewArea.classList.add('hidden');
       return;
     }
@@ -1554,6 +1618,26 @@
         <button class="image-preview-remove" title="Remove image" data-index="${i}">&times;</button>
       `;
       div.querySelector('.image-preview-remove').addEventListener('click', () => removeImage(i));
+      imagePreviewArea.appendChild(div);
+    });
+    pendingFiles.forEach((file, i) => {
+      const div = document.createElement('div');
+      div.className = 'file-preview-item';
+      const icon = file.type === 'pdf' ? '📄' : file.type === 'docx' ? '📝' : '📎';
+      const sizeLabel = file.content.length > 1000
+        ? `${(file.content.length / 1000).toFixed(0)}K chars`
+        : `${file.content.length} chars`;
+      div.innerHTML = `
+        <span>${icon}</span>
+        <span class="file-preview-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
+        <span style="color:var(--text-muted);font-size:0.65rem">${sizeLabel}</span>
+        <button class="file-preview-remove" title="Remove file" data-index="${i}">&times;</button>
+      `;
+      div.querySelector('.file-preview-remove').addEventListener('click', () => {
+        pendingFiles.splice(i, 1);
+        renderImagePreviews();
+        updateSendButton();
+      });
       imagePreviewArea.appendChild(div);
     });
   }
@@ -1630,11 +1714,30 @@
 
     let textContent = '';
     let images = [];
+    let files = [];
     if (typeof content === 'object' && content !== null && !Array.isArray(content)) {
       textContent = content.text || '';
       images = content.images || [];
+      files = content.files || [];
     } else {
       textContent = content || '';
+    }
+
+    // For user messages with file attachments, strip the inline file text
+    // (we show file cards instead)
+    if (role === 'user' && files.length > 0) {
+      files.forEach(f => {
+        const marker = `--- Attached file: ${f.name} ---`;
+        const endMarker = `--- End of ${f.name} ---`;
+        const startIdx = textContent.indexOf(marker);
+        if (startIdx !== -1) {
+          const endIdx = textContent.indexOf(endMarker);
+          if (endIdx !== -1) {
+            textContent = textContent.substring(0, startIdx) + textContent.substring(endIdx + endMarker.length);
+          }
+        }
+      });
+      textContent = textContent.replace(/\n{3,}/g, '\n').trim();
     }
 
     let imagesHtml = '';
@@ -1642,6 +1745,39 @@
       imagesHtml = '<div class="message-images">' +
         images.map(img => `<div class="message-image" onclick="window.__openLightbox(this)"><img src="${img.dataUrl}" alt="Image"></div>`).join('') +
         '</div>';
+    }
+
+    // File attachment cards (input side)
+    let fileCardsHtml = '';
+    if (files.length > 0) {
+      const cards = files.map((f, fi) => {
+        const ext = f.name.split('.').pop().toUpperCase();
+        const sizeLabel = f.content.length > 1000
+          ? `${(f.content.length / 1000).toFixed(0)}K chars`
+          : `${f.content.length} chars`;
+        return `
+          <div class="file-card" data-file-index="${fi}">
+            <div class="file-card-icon">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+            </div>
+            <div class="file-card-info">
+              <div class="file-card-name">${escapeHtml(f.name)}</div>
+              <div class="file-card-meta">Document &middot; ${ext} &middot; ${sizeLabel}</div>
+            </div>
+            <button class="file-card-download" onclick="window.__downloadFile(this)" data-name="${escapeHtml(f.name)}" data-content-index="${messageIndex}-${fi}">Download</button>
+          </div>
+        `;
+      }).join('');
+      const downloadAll = files.length > 1
+        ? `<button class="file-card-download-all" onclick="window.__downloadAllFiles(this)" data-msg-index="${messageIndex}">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download all
+          </button>`
+        : '';
+      fileCardsHtml = `<div class="file-cards">${cards}${downloadAll}</div>`;
     }
 
     const renderedContent = role === 'user' ? escapeHtml(textContent) : renderMarkdown(textContent);
@@ -1763,7 +1899,7 @@
         ${exportBar}
         <div class="message-avatar">${avatar}</div>
         <div class="message-body">
-          <div class="message-content">${imagesHtml}${renderedContent}</div>
+          <div class="message-content">${imagesHtml}${renderedContent}${fileCardsHtml}</div>
           ${actionsHtml}
         </div>
       </div>
@@ -1830,6 +1966,64 @@
     lb.innerHTML = `<img src="${imgSrc}">`;
     lb.addEventListener('click', () => lb.remove());
     document.body.appendChild(lb);
+  };
+
+  // File download handlers
+  window.__downloadFile = function(btn) {
+    const name = btn.dataset.name;
+    const idxParts = btn.dataset.contentIndex.split('-');
+    const msgIdx = parseInt(idxParts[0]);
+    const fileIdx = parseInt(idxParts[1]);
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv || !conv.messages[msgIdx]) return;
+    const msg = conv.messages[msgIdx];
+    const msgContent = typeof msg.content === 'object' ? msg.content : {};
+    const files = msgContent.files || [];
+    if (!files[fileIdx]) return;
+
+    const blob = new Blob([files[fileIdx].content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  window.__downloadAllFiles = function(btn) {
+    const msgIdx = parseInt(btn.dataset.msgIndex);
+    const conv = state.conversations[state.activeConversationId];
+    if (!conv || !conv.messages[msgIdx]) return;
+    const msg = conv.messages[msgIdx];
+    const msgContent = typeof msg.content === 'object' ? msg.content : {};
+    const files = msgContent.files || [];
+    files.forEach(f => {
+      const blob = new Blob([f.content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = f.name;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  };
+
+  // Download AI-generated code block as file
+  window.__downloadCodeBlock = function(btn) {
+    const codeBlock = btn.closest('.code-block');
+    const codeEl = codeBlock.querySelector('.code-block-code');
+    const langEl = codeBlock.querySelector('.code-block-lang');
+    const text = codeEl.innerText || codeEl.textContent;
+    const lang = langEl ? langEl.textContent.trim().toLowerCase() : 'txt';
+    const ext = { python: 'py', javascript: 'js', typescript: 'ts', java: 'java', html: 'html', css: 'css', json: 'json', yaml: 'yml', sql: 'sql', bash: 'sh', shell: 'sh', go: 'go', rust: 'rs', ruby: 'rb', cpp: 'cpp', c: 'c', markdown: 'md', text: 'txt' }[lang] || lang || 'txt';
+    const name = `code.${ext}`;
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   // ═══════════════════════════════════════════════════
@@ -2137,8 +2331,32 @@
   function updateConversationTokenDisplay() {
     if (!inputHint) return;
     const conv = state.conversations[state.activeConversationId];
+
+    // Calculate total cost — use the persistent localStorage total
+    // (includes deleted chats) or recalculate from existing chats, whichever is higher
+    let calculatedCost = 0;
+    Object.values(state.conversations).forEach(c => {
+      if (c.messages) {
+        c.messages.forEach(m => {
+          if (m.role === 'assistant' && m.usage) {
+            calculatedCost += estimateCost(m.usage, state.selectedModel);
+          }
+        });
+      }
+    });
+    const storedCost = parseFloat(localStorage.getItem(TOTAL_COST_KEY)) || 0;
+    const allChatsCost = Math.max(calculatedCost, storedCost);
+    // Keep localStorage in sync (in case recalculated is higher, e.g. first run)
+    if (calculatedCost > storedCost) {
+      localStorage.setItem(TOTAL_COST_KEY, calculatedCost.toString());
+    }
+
+    const allChatsTag = allChatsCost > 0
+      ? ` &nbsp;|&nbsp; <span class="all-chats-cost" title="Total estimated cost (includes deleted chats)">Total: ${formatCost(allChatsCost)}</span>`
+      : '';
+
     if (!conv) {
-      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images`;
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images${allChatsTag}`;
       return;
     }
 
@@ -2172,9 +2390,9 @@
     if (lastTurnTokens > 0) {
       const promptPart = (lastTurnUsage.prompt_tokens || 0).toLocaleString();
       const outputPart = totalOutputTokens.toLocaleString();
-      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line &nbsp;|&nbsp; <span class="token-stats">${promptPart} ctx + ${outputPart} out (${formatCost(totalCost)})</span>${sessionTag}`;
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line &nbsp;|&nbsp; <span class="token-stats">${promptPart} ctx + ${outputPart} out</span> &nbsp;|&nbsp; <span class="session-cost" title="This conversation's cost">This chat: ${formatCost(totalCost)}</span>${allChatsTag}`;
     } else {
-      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images${sessionTag}`;
+      inputHint.innerHTML = `<kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line, <kbd>Ctrl+V</kbd> to paste images${allChatsTag}`;
     }
   }
 
@@ -2276,8 +2494,17 @@
 
   // ─── Send message ─────────────────────────────────
   async function sendMessage(resendMode) {
-    const text = resendMode ? '' : chatInput.value.trim();
+    let text = resendMode ? '' : chatInput.value.trim();
     const images = resendMode ? [] : [...pendingImages];
+    const files = resendMode ? [] : [...pendingFiles];
+
+    // Prepend file contents to the message text
+    if (files.length > 0) {
+      const fileBlocks = files.map(f =>
+        `--- Attached file: ${f.name} ---\n${f.content}\n--- End of ${f.name} ---`
+      ).join('\n\n');
+      text = text ? `${fileBlocks}\n\n${text}` : fileBlocks;
+    }
 
     if (!resendMode && !text && images.length === 0) return;
     if (state.isStreaming) return;
@@ -2317,8 +2544,12 @@
       const ws = chatMessages.querySelector('.welcome');
       if (ws) ws.remove();
 
-      const storageContent = (images.length > 0)
-        ? { text, images: images.map(img => ({ dataUrl: img.dataUrl, mimeType: img.mimeType })) }
+      const storageContent = (images.length > 0 || files.length > 0)
+        ? {
+            text,
+            images: images.map(img => ({ dataUrl: img.dataUrl, mimeType: img.mimeType })),
+            files: files.map(f => ({ name: f.name, content: f.content, type: f.type })),
+          }
         : text;
 
       conv.messages.push({ role: 'user', content: storageContent });
@@ -2330,6 +2561,7 @@
       chatMessages.appendChild(createMessageElement('user', storageContent, conv.messages.length - 1, conv.messages[conv.messages.length - 1]));
       chatInput.value = '';
       pendingImages = [];
+      pendingFiles = [];
       renderImagePreviews();
       autoResize();
       scrollToBottom();
@@ -2359,6 +2591,10 @@
     let fullResponse = '';
     let fallbackChecked = false;
     let lastUsage = null;
+
+    // Store refs for visibility change handler (re-render when tab becomes visible)
+    state._streamingContentEl = assistantDiv.querySelector('.message-content');
+    state._streamingResponse = () => fullResponse;
 
     try {
       const abortController = new AbortController();
@@ -2496,8 +2732,23 @@
     if (lastUsage) {
       assistantMsg.usage = lastUsage;
       // Track session-wide cost
-      state.sessionCost += estimateCost(lastUsage, model);
+      const turnCost = estimateCost(lastUsage, model);
+      state.sessionCost += turnCost;
       state.sessionMessages++;
+      // Persist running total in localStorage (survives deletes & reloads)
+      const prev = parseFloat(localStorage.getItem(TOTAL_COST_KEY)) || 0;
+      localStorage.setItem(TOTAL_COST_KEY, (prev + turnCost).toString());
+      // Log timestamped cost entry for dashboard
+      const history = JSON.parse(localStorage.getItem(COST_HISTORY_KEY) || '[]');
+      history.push({
+        ts: Date.now(),
+        cost: turnCost,
+        model: model,
+        promptTokens: lastUsage.prompt_tokens || 0,
+        completionTokens: lastUsage.completion_tokens || 0,
+        convTitle: conv.title || 'Untitled',
+      });
+      localStorage.setItem(COST_HISTORY_KEY, JSON.stringify(history));
     }
     // NOTE: do NOT store effort here — the only real proof is reasoning_tokens in usage
     conv.messages.push(assistantMsg);
@@ -2505,6 +2756,8 @@
     saveState();
     syncConversationToServer(conv);
     const wasScrolledUp = _userScrolledUp;   // capture before setStreaming resets it
+    state._streamingContentEl = null;
+    state._streamingResponse = null;
     setStreaming(false);
 
     // Re-render to show action buttons, token info, etc.
@@ -2566,6 +2819,12 @@
                 <line x1="12" y1="3" x2="12" y2="21"/>
               </svg>
               Open
+            </button>
+            <button class="code-copy-btn" onclick="window.__downloadCodeBlock(this)" title="Download as file">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download
             </button>
             <button class="code-copy-btn" onclick="window.__copyCode(this)">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
@@ -2925,6 +3184,123 @@
     }
   }
 
+  // ─── Cost Dashboard ────────────────────────────────
+  const costDashBtn = $('#costDashBtn');
+  const costPopup = $('#costPopup');
+  const costPopupClose = $('#costPopupClose');
+  const costSummary = $('#costSummary');
+  const costBreakdown = $('#costBreakdown');
+  const costClearHistory = $('#costClearHistory');
+  let _costRange = 'today';
+
+  function getCostHistory() {
+    return JSON.parse(localStorage.getItem(COST_HISTORY_KEY) || '[]');
+  }
+
+  function getStartOfDay(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function getStartOfWeek(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - d.getDay()); // Sunday start
+    return d.getTime();
+  }
+
+  function getStartOfMonth(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    d.setDate(1);
+    return d.getTime();
+  }
+
+  function filterCostHistory(range) {
+    const history = getCostHistory();
+    const now = new Date();
+    let cutoff = 0;
+    if (range === 'today') cutoff = getStartOfDay(now);
+    else if (range === 'week') cutoff = getStartOfWeek(now);
+    else if (range === 'month') cutoff = getStartOfMonth(now);
+    else cutoff = 0; // all time
+
+    return history.filter(e => e.ts >= cutoff);
+  }
+
+  function renderCostDashboard() {
+    const entries = filterCostHistory(_costRange);
+    const totalCost = entries.reduce((sum, e) => sum + (e.cost || 0), 0);
+    const totalPrompt = entries.reduce((sum, e) => sum + (e.promptTokens || 0), 0);
+    const totalCompletion = entries.reduce((sum, e) => sum + (e.completionTokens || 0), 0);
+    const msgCount = entries.length;
+
+    // Summary cards
+    costSummary.innerHTML = `
+      <div class="cost-card">
+        <div class="cost-card-value">${formatCost(totalCost)}</div>
+        <div class="cost-card-label">Total Spend</div>
+      </div>
+      <div class="cost-card">
+        <div class="cost-card-value">${msgCount}</div>
+        <div class="cost-card-label">API Calls</div>
+      </div>
+      <div class="cost-card">
+        <div class="cost-card-value">${formatTokenCount(totalPrompt)}</div>
+        <div class="cost-card-label">Input Tokens</div>
+      </div>
+      <div class="cost-card">
+        <div class="cost-card-value">${formatTokenCount(totalCompletion)}</div>
+        <div class="cost-card-label">Output Tokens</div>
+      </div>
+    `;
+
+    // Per-day breakdown
+    const byDay = {};
+    entries.forEach(e => {
+      const day = new Date(e.ts).toLocaleDateString();
+      if (!byDay[day]) byDay[day] = { cost: 0, count: 0, models: {} };
+      byDay[day].cost += e.cost || 0;
+      byDay[day].count++;
+      const m = e.model || 'unknown';
+      byDay[day].models[m] = (byDay[day].models[m] || 0) + (e.cost || 0);
+    });
+
+    const days = Object.keys(byDay).sort((a, b) => new Date(b) - new Date(a));
+    if (days.length === 0) {
+      costBreakdown.innerHTML = '<div class="cost-empty">No cost data for this period.</div>';
+      return;
+    }
+
+    costBreakdown.innerHTML = days.map(day => {
+      const d = byDay[day];
+      const modelTags = Object.entries(d.models)
+        .sort((a, b) => b[1] - a[1])
+        .map(([m, c]) => `<span class="cost-model-tag">${m.split('/').pop()}: ${formatCost(c)}</span>`)
+        .join('');
+      return `
+        <div class="cost-day-row">
+          <div class="cost-day-header">
+            <span class="cost-day-date">${day}</span>
+            <span class="cost-day-total">${formatCost(d.cost)}</span>
+          </div>
+          <div class="cost-day-detail">${d.count} call${d.count !== 1 ? 's' : ''} &middot; ${modelTags}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function toggleCostPopup() {
+    const isOpen = !costPopup.classList.contains('hidden');
+    if (isOpen) {
+      costPopup.classList.add('hidden');
+    } else {
+      renderCostDashboard();
+      costPopup.classList.remove('hidden');
+    }
+  }
+
   // ─── UI Helpers ───────────────────────────────────
 
   // Track whether the user has deliberately scrolled away from the bottom.
@@ -2939,10 +3315,27 @@
   }
 
   // Listen for manual scroll on the chat container
+  const scrollToBottomBtn = $('#scrollToBottomBtn');
   chatContainer.addEventListener('scroll', () => {
-    if (!state.isStreaming) return;          // only matters during streaming
-    _userScrolledUp = !isUserNearBottom();
+    const nearBottom = isUserNearBottom();
+
+    // Show/hide the scroll-to-bottom button
+    if (scrollToBottomBtn) {
+      scrollToBottomBtn.classList.toggle('hidden', nearBottom);
+    }
+
+    // Track user scroll-up during streaming
+    if (state.isStreaming) {
+      _userScrolledUp = !nearBottom;
+    }
   });
+
+  // Click the button to jump to bottom
+  if (scrollToBottomBtn) {
+    scrollToBottomBtn.addEventListener('click', () => {
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    });
+  }
 
   /**
    * Scroll the chat to the bottom.
@@ -2963,7 +3356,7 @@
   }
 
   function updateSendButton() {
-    sendBtn.disabled = state.isStreaming || (!chatInput.value.trim() && pendingImages.length === 0);
+    sendBtn.disabled = state.isStreaming || (!chatInput.value.trim() && pendingImages.length === 0 && pendingFiles.length === 0);
   }
 
   function escapeHtml(str) {
@@ -3042,9 +3435,42 @@
 
   // ─── Event binding ────────────────────────────────
   function bindEvents() {
+    // Re-render streaming content when tab becomes visible again
+    // Browsers throttle background tabs; content may appear blank when returning
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.isStreaming && state._streamingContentEl && state._streamingResponse) {
+        const text = state._streamingResponse();
+        if (text) {
+          state._streamingContentEl.innerHTML = renderMarkdown(text);
+          state._streamingContentEl.classList.add('streaming-cursor');
+        }
+      }
+    });
+
     newChatBtn.addEventListener('click', () => createConversation());
     sendBtn.addEventListener('click', () => sendMessage());
     stopBtn.addEventListener('click', stopStreaming);
+
+    // Attach file button
+    const attachBtn = $('#attachBtn');
+    if (attachBtn) {
+      attachBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.pdf,.docx,.txt,.md,.json,.csv,.xml,.html,.py,.js,.ts,.java,.c,.cpp,.h,.css,.yaml,.yml,.toml,.sql,.sh,.rb,.go,.rs,.log,.png,.jpg,.jpeg,.gif,.webp';
+        input.multiple = true;
+        input.addEventListener('change', () => {
+          for (const file of input.files) {
+            if (file.type.startsWith('image/')) {
+              readImageFile(file);
+            } else {
+              handleFileAttachment(file);
+            }
+          }
+        });
+        input.click();
+      });
+    }
 
     chatInput.addEventListener('input', () => {
       autoResize();
@@ -3202,6 +3628,42 @@
     if (exportBtn) {
       exportBtn.addEventListener('click', exportConversation);
     }
+
+    // Cost dashboard
+    if (costDashBtn) {
+      costDashBtn.addEventListener('click', toggleCostPopup);
+    }
+    if (costPopupClose) {
+      costPopupClose.addEventListener('click', () => costPopup.classList.add('hidden'));
+    }
+    // Filter buttons
+    document.querySelectorAll('.cost-filter-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.cost-filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        _costRange = btn.dataset.range;
+        renderCostDashboard();
+      });
+    });
+    // Clear history
+    if (costClearHistory) {
+      costClearHistory.addEventListener('click', () => {
+        if (confirm('Clear all cost history? This cannot be undone.')) {
+          localStorage.removeItem(COST_HISTORY_KEY);
+          localStorage.removeItem(TOTAL_COST_KEY);
+          renderCostDashboard();
+          updateConversationTokenDisplay();
+          showToast('Cost history cleared.', 'success');
+        }
+      });
+    }
+    // Close popup on outside click
+    document.addEventListener('click', (e) => {
+      if (costPopup && !costPopup.classList.contains('hidden') &&
+          !costPopup.contains(e.target) && e.target !== costDashBtn && !costDashBtn.contains(e.target)) {
+        costPopup.classList.add('hidden');
+      }
+    });
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
