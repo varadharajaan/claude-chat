@@ -22,10 +22,12 @@ import threading
 import time
 import webbrowser
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
 PORT = int(os.environ.get("CHAT_PORT", 8090))
+PROXY_UPSTREAM = os.environ.get("PROXY_UPSTREAM", "http://localhost:5000")
 DATA_DIR = Path(__file__).parent / "data"
 CHAT_LOG_FILE = DATA_DIR / "chat-server.log"
 
@@ -377,6 +379,11 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        # Reverse proxy to LiteLLM
+        if path.startswith('/proxy/'):
+            self._proxy_request('GET')
+            return
+
         # Log API
         if path == '/api/logs':
             self.handle_logs(parsed)
@@ -411,6 +418,11 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        # Reverse proxy to LiteLLM
+        if path.startswith('/proxy/'):
+            self._proxy_request('POST')
+            return
 
         if path == '/api/conversations':
             self.handle_save_conversation()
@@ -743,6 +755,62 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json({'ok': False, 'error': str(e)})
 
     # ─── Helpers ────────────────────────────────────
+
+    def _proxy_request(self, method):
+        """Reverse-proxy a request to localhost:{port}, streaming the response back.
+        Path format: /proxy/{port}/... -> http://localhost:{port}/..."""
+        rest = self.path[len('/proxy'):]
+        m = re.match(r'^/(\d+)(/.*)$', rest)
+        if m:
+            upstream_url = f"http://localhost:{m.group(1)}{m.group(2)}"
+        else:
+            upstream_path = rest if rest else '/'
+            upstream_url = f"{PROXY_UPSTREAM}{upstream_path}"
+
+        # Read request body if present
+        body = None
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+
+        # Forward headers (skip hop-by-hop)
+        fwd_headers = {}
+        skip = {'host', 'connection', 'transfer-encoding'}
+        for key, val in self.headers.items():
+            if key.lower() not in skip:
+                fwd_headers[key] = val
+
+        try:
+            req = urllib.request.Request(upstream_url, data=body, headers=fwd_headers, method=method)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                status = resp.status
+                self.send_response(status)
+                # Copy response headers
+                for key, val in resp.getheaders():
+                    if key.lower() not in ('transfer-encoding', 'connection'):
+                        self.send_header(key, val)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                # Stream response body in chunks
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            err_body = e.read()
+            if err_body:
+                self.wfile.write(err_body)
+        except Exception as e:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': {'message': f'Proxy error: {e}', 'type': 'proxy_error'}}).encode())
 
     def _read_body(self):
         """Read the request body."""

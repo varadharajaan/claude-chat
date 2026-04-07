@@ -118,11 +118,23 @@ def is_port_open(port, host="127.0.0.1"):
 def kill_pid(pid, graceful_timeout=3):
     """Kill a process by PID. Try graceful first, then force."""
     if os.name == "nt":
-        # Windows: taskkill /T kills the process tree
-        subprocess.run(
+        # Try taskkill without /T first (faster, avoids tree-walk hangs),
+        # then fall back to /T, then os.kill as last resort.
+        for args in [
+            ["taskkill", "/PID", str(pid), "/F"],
             ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True, timeout=10
-        )
+        ]:
+            try:
+                result = subprocess.run(args, capture_output=True, timeout=10)
+                if result.returncode == 0:
+                    return
+            except subprocess.TimeoutExpired:
+                continue
+        # All taskkill attempts failed — direct kill
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
     else:
         try:
             os.kill(pid, signal.SIGTERM)

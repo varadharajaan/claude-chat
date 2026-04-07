@@ -13,6 +13,8 @@
   const THEME_KEY = 'claude-chat-theme';
   const MODEL_KEY = 'claude-chat-model';
   const EFFORT_KEY = 'claude-chat-effort';
+  const THINKING_KEY = 'claude-chat-thinking';
+  const THINKING_BUDGET_KEY = 'claude-chat-thinking-budget';
   const PROXY_KEY = 'claude-chat-proxy';
   const PROJECT_KEY = 'claude-chat-active-project';
   const TOTAL_COST_KEY = 'claude-chat-total-cost';
@@ -146,6 +148,8 @@
     models: [],
     selectedModel: '',
     selectedEffort: 'high',  // low | medium | high  (mirrors CLI /model effort)
+    thinkingEnabled: true,   // extended thinking on/off (mirrors CLI /thinking)
+    thinkingBudget: 10000,   // thinking token budget (1024-128000)
     isStreaming: false,
     abortController: null,
     logPanelOpen: false,
@@ -457,6 +461,13 @@
     if (savedModel) state.selectedModel = savedModel;
     const savedEffort = localStorage.getItem(EFFORT_KEY);
     if (savedEffort && ['low','medium','high'].includes(savedEffort)) state.selectedEffort = savedEffort;
+    const savedThinking = localStorage.getItem(THINKING_KEY);
+    if (savedThinking !== null) state.thinkingEnabled = JSON.parse(savedThinking);
+    const savedBudget = localStorage.getItem(THINKING_BUDGET_KEY);
+    if (savedBudget !== null) {
+      const b = parseInt(savedBudget, 10);
+      if (!isNaN(b) && b >= 1024 && b <= 128000) state.thinkingBudget = b;
+    }
     const savedProject = localStorage.getItem(PROJECT_KEY);
     if (savedProject) state.activeProjectId = savedProject;
   }
@@ -597,7 +608,11 @@
   }
 
   function getProxyUrl() {
-    return (proxyInput.value || 'http://localhost:5000').replace(/\/+$/, '');
+    const val = (proxyInput.value || 'http://localhost:5000').replace(/\/+$/, '');
+    // Route localhost URLs through same-origin reverse proxy to avoid CORS
+    const m = val.match(/^https?:\/\/localhost:(\d+)$/);
+    if (m) return `/proxy/${m[1]}`;
+    return val;
   }
 
   async function checkProxyHealth(silent) {
@@ -2492,11 +2507,581 @@
     return apiMessages;
   }
 
+  // ─── Slash Commands ───────────────────────────────────────────────
+  // CLI-style commands typed in chat input: /model, /effort, /thinking, /help
+  // Commands are intercepted before the API call and rendered locally.
+
+  const SLASH_COMMANDS = {
+    model: {
+      name: 'model',
+      usage: '/model [name]',
+      description: 'Switch model or list available models',
+      handler: handleModelCommand,
+      getSubOptions: () => {
+        const currentModel = modelSelector.value || state.selectedModel;
+        const groups = {};
+        state.models.forEach(id => {
+          const group = getModelGroup(id);
+          if (!groups[group]) groups[group] = [];
+          groups[group].push(id);
+        });
+        const items = [];
+        GROUP_ORDER.forEach(groupName => {
+          if (!groups[groupName] || groups[groupName].length === 0) return;
+          items.push({ type: 'group', label: groupName });
+          groups[groupName].forEach(id => {
+            items.push({
+              type: 'option',
+              label: getModelLabel(id),
+              value: id,
+              active: id === currentModel,
+              action: () => {
+                state.selectedModel = id;
+                modelSelector.value = id;
+                localStorage.setItem(MODEL_KEY, id);
+                applyEffortUI();
+                showToast(`Model → ${getModelLabel(id)}`);
+              },
+            });
+          });
+          delete groups[groupName];
+        });
+        Object.entries(groups).forEach(([groupName, ids]) => {
+          if (ids.length === 0) return;
+          items.push({ type: 'group', label: groupName });
+          ids.forEach(id => {
+            items.push({
+              type: 'option',
+              label: getModelLabel(id),
+              value: id,
+              active: id === currentModel,
+              action: () => {
+                state.selectedModel = id;
+                modelSelector.value = id;
+                localStorage.setItem(MODEL_KEY, id);
+                applyEffortUI();
+                showToast(`Model → ${getModelLabel(id)}`);
+              },
+            });
+          });
+        });
+        return items;
+      },
+    },
+    effort: {
+      name: 'effort',
+      usage: '/effort [low|medium|high]',
+      description: 'Change reasoning effort level',
+      handler: handleEffortCommand,
+      getSubOptions: () => [
+        { type: 'option', label: 'Low', value: 'low', active: state.selectedEffort === 'low',
+          action: () => { handleEffortCommand(['low']); }},
+        { type: 'option', label: 'Medium', value: 'medium', active: state.selectedEffort === 'medium',
+          action: () => { handleEffortCommand(['medium']); }},
+        { type: 'option', label: 'High', value: 'high', active: state.selectedEffort === 'high',
+          action: () => { handleEffortCommand(['high']); }},
+      ],
+    },
+    thinking: {
+      name: 'thinking',
+      usage: '/thinking [on|off|budget <tokens>]',
+      description: 'Enable/disable extended thinking or set budget',
+      handler: handleThinkingCommand,
+      getSubOptions: () => [
+        { type: 'option', label: 'On', value: 'on', active: state.thinkingEnabled,
+          action: () => { handleThinkingCommand(['on']); }},
+        { type: 'option', label: 'Off', value: 'off', active: !state.thinkingEnabled,
+          action: () => { handleThinkingCommand(['off']); }},
+      ],
+    },
+    help: {
+      name: 'help',
+      usage: '/help',
+      description: 'Show available slash commands',
+      handler: handleHelpCommand,
+    },
+    cost: {
+      name: 'cost',
+      usage: '/cost [today|week|month|all]',
+      description: 'Show cost and token usage summary',
+      handler: handleCostCommand,
+      getSubOptions: () => [
+        { type: 'option', label: 'Today', value: 'today',
+          action: () => { handleCostCommand(['today']); }},
+        { type: 'option', label: 'This Week', value: 'week',
+          action: () => { handleCostCommand(['week']); }},
+        { type: 'option', label: 'This Month', value: 'month',
+          action: () => { handleCostCommand(['month']); }},
+        { type: 'option', label: 'All Time', value: 'all',
+          action: () => { handleCostCommand(['all']); }},
+      ],
+    },
+  };
+
+  /**
+   * Parse a chat input string for slash commands.
+   * @param {string} text — raw trimmed input text
+   * @returns {{ command: string, args: string[] } | null}
+   */
+  function parseSlashCommand(text) {
+    if (!text.startsWith('/')) return null;
+    const parts = text.split(/\s+/);
+    const commandName = parts[0].substring(1).toLowerCase();
+    if (!SLASH_COMMANDS[commandName]) {
+      return { command: '__unknown__', args: [parts[0]] };
+    }
+    return { command: commandName, args: parts.slice(1) };
+  }
+
+  /**
+   * Execute a parsed slash command.
+   * @param {{ command: string, args: string[] }} parsed
+   * @returns {{ type: 'success'|'error'|'info', content: string }}
+   */
+  function executeSlashCommand(parsed) {
+    if (parsed.command === '__unknown__') {
+      return {
+        type: 'error',
+        content: `Unknown command \`${parsed.args[0]}\`. Type \`/help\` for available commands.`,
+      };
+    }
+    return SLASH_COMMANDS[parsed.command].handler(parsed.args);
+  }
+
+  // ─── /model handler ──────────────────────────────────
+  function handleModelCommand(args) {
+    if (args.length === 0) {
+      if (state.models.length === 0) {
+        return { type: 'error', content: 'Models are still loading. Try again in a moment.' };
+      }
+      const currentModel = modelSelector.value || state.selectedModel;
+
+      // Group models like the dropdown does
+      const groups = {};
+      state.models.forEach(id => {
+        const group = getModelGroup(id);
+        if (!groups[group]) groups[group] = [];
+        groups[group].push(id);
+      });
+
+      // Build grouped HTML — rendered as interactive buttons
+      let html = '<div class="cmd-model-list">';
+      GROUP_ORDER.forEach(groupName => {
+        if (!groups[groupName] || groups[groupName].length === 0) return;
+        html += `<div class="cmd-model-group"><div class="cmd-model-group-label">${groupName}</div>`;
+        groups[groupName].forEach(id => {
+          const label = getModelLabel(id);
+          const isActive = id === currentModel;
+          html += `<button class="cmd-model-btn${isActive ? ' active' : ''}" data-model-id="${id}">${label}${isActive ? ' ✦' : ''}</button>`;
+        });
+        html += '</div>';
+        delete groups[groupName];
+      });
+      // Remaining groups not in GROUP_ORDER
+      Object.entries(groups).forEach(([groupName, ids]) => {
+        if (ids.length === 0) return;
+        html += `<div class="cmd-model-group"><div class="cmd-model-group-label">${groupName}</div>`;
+        ids.forEach(id => {
+          const label = getModelLabel(id);
+          const isActive = id === currentModel;
+          html += `<button class="cmd-model-btn${isActive ? ' active' : ''}" data-model-id="${id}">${label}${isActive ? ' ✦' : ''}</button>`;
+        });
+        html += '</div>';
+      });
+      html += '</div>';
+      html += '<p style="margin-top:8px;font-size:0.8rem;color:var(--text-muted)">Click a model to switch, or type <code>/model &lt;name&gt;</code></p>';
+
+      return { type: 'info', content: html, isHtml: true };
+    }
+
+    const query = args.join(' ').toLowerCase();
+    const match = state.models.find(id =>
+      id.toLowerCase() === query ||
+      getModelLabel(id).toLowerCase() === query
+    ) || state.models.find(id =>
+      id.toLowerCase().includes(query) ||
+      getModelLabel(id).toLowerCase().includes(query)
+    );
+
+    if (!match) {
+      return {
+        type: 'error',
+        content: `No model matching "${args.join(' ')}". Type \`/model\` to see available models.`,
+      };
+    }
+
+    state.selectedModel = match;
+    modelSelector.value = match;
+    localStorage.setItem(MODEL_KEY, match);
+    showToast(`Model → ${getModelLabel(match)}`);
+
+    return {
+      type: 'success',
+      content: `Model switched to **${getModelLabel(match)}** (\`${match}\`)`,
+    };
+  }
+
+  // ─── /effort handler ─────────────────────────────────
+  function handleEffortCommand(args) {
+    const VALID = ['low', 'medium', 'high'];
+    if (args.length === 0) {
+      const cap = state.selectedEffort.charAt(0).toUpperCase() + state.selectedEffort.slice(1);
+      return {
+        type: 'info',
+        content: `Current effort: **${cap}**\n\nUsage: \`/effort low|medium|high\``,
+      };
+    }
+    const level = args[0].toLowerCase();
+    if (!VALID.includes(level)) {
+      return {
+        type: 'error',
+        content: `Invalid effort level "${args[0]}". Choose: \`low\`, \`medium\`, or \`high\`.`,
+      };
+    }
+    state.selectedEffort = level;
+    localStorage.setItem(EFFORT_KEY, level);
+    applyEffortUI();
+    const cap = level.charAt(0).toUpperCase() + level.slice(1);
+    showToast(`Effort → ${cap}`);
+    return {
+      type: 'success',
+      content: `Reasoning effort set to **${cap}**`,
+    };
+  }
+
+  // ─── /thinking handler ───────────────────────────────
+  function handleThinkingCommand(args) {
+    if (args.length === 0) {
+      const status = state.thinkingEnabled ? 'ON' : 'OFF';
+      const currentModel = modelSelector.value || state.selectedModel;
+      const isAdaptive = /claude-(opus|sonnet)-4-6/i.test(currentModel) ||
+        /^(opus|sonnet)(-1m)?$/i.test(currentModel);
+      const modeInfo = isAdaptive
+        ? 'Mode: **adaptive** (Opus/Sonnet 4.6 — budget not needed)'
+        : `Budget: **${state.thinkingBudget.toLocaleString()} tokens** (for older models)`;
+      return {
+        type: 'info',
+        content: `Extended thinking: **${status}**\n${modeInfo}\n\nUsage: \`/thinking on|off\` or \`/thinking budget <tokens>\``,
+      };
+    }
+    const sub = args[0].toLowerCase();
+    if (sub === 'on' || sub === 'off') {
+      state.thinkingEnabled = (sub === 'on');
+      localStorage.setItem(THINKING_KEY, JSON.stringify(state.thinkingEnabled));
+      applyThinkingUI();
+      showToast(`Thinking → ${sub.toUpperCase()}`);
+      return {
+        type: 'success',
+        content: `Extended thinking **${sub === 'on' ? 'enabled' : 'disabled'}**`,
+      };
+    }
+    if (sub === 'budget' && args[1]) {
+      const tokens = parseInt(args[1], 10);
+      if (isNaN(tokens) || tokens < 1024 || tokens > 128000) {
+        return {
+          type: 'error',
+          content: `Invalid budget. Must be a number between 1,024 and 128,000.`,
+        };
+      }
+      state.thinkingBudget = tokens;
+      localStorage.setItem(THINKING_BUDGET_KEY, JSON.stringify(tokens));
+      showToast(`Thinking budget → ${tokens.toLocaleString()}`);
+      return {
+        type: 'success',
+        content: `Thinking budget set to **${tokens.toLocaleString()} tokens**`,
+      };
+    }
+    return {
+      type: 'error',
+      content: `Unknown thinking option "${args[0]}". Use \`on\`, \`off\`, or \`budget <tokens>\`.`,
+    };
+  }
+
+  // ─── /help handler ───────────────────────────────────
+  function handleHelpCommand(_args) {
+    const lines = Object.values(SLASH_COMMANDS).map(cmd =>
+      `\`${cmd.usage}\` — ${cmd.description}`
+    );
+    return {
+      type: 'info',
+      content: `**Available commands:**\n\n${lines.join('\n')}\n\n_Commands are local — they are not sent to the model._`,
+    };
+  }
+
+  // ─── /cost handler ────────────────────────────────────
+  function handleCostCommand(args) {
+    const range = (args[0] || 'today').toLowerCase();
+    const validRanges = ['today', 'week', 'month', 'all'];
+    const rangeToUse = validRanges.includes(range) ? range : 'today';
+
+    // Open the existing cost dashboard popup with the selected range
+    const costPopupEl = document.getElementById('costPopup');
+    if (costPopupEl) {
+      // Set the range filter (using try-catch since _costRange is declared later)
+      try {
+        _costRange = rangeToUse;
+        // Sync filter buttons
+        document.querySelectorAll('.cost-filter-btn').forEach(btn => {
+          btn.classList.toggle('active', btn.dataset.range === rangeToUse);
+        });
+        renderCostDashboard();
+      } catch (e) { /* _costRange not yet initialized — unlikely at runtime */ }
+      costPopupEl.classList.remove('hidden');
+    }
+
+    const rangeLabels = { today: 'Today', week: 'This week', month: 'This month', all: 'All time' };
+    return { type: 'success', content: `Cost dashboard opened — **${rangeLabels[rangeToUse] || rangeToUse}**` };
+  }
+
+  // ─── Command result rendering ────────────────────────
+  /**
+   * Render a slash command and its result into the chat area.
+   * These are DOM-only — NOT added to conversation state.
+   */
+  function renderCommandResult(inputText, result) {
+    // Remove welcome screen if present
+    const ws = chatMessages.querySelector('.welcome');
+    if (ws) ws.remove();
+
+    // 1. Echo the typed command
+    const echoDiv = document.createElement('div');
+    echoDiv.className = 'message command-echo';
+    echoDiv.innerHTML = `
+      <div class="message-wrapper">
+        <div class="command-echo-content">
+          <span class="command-prompt">❯</span> <code>${escapeHtml(inputText)}</code>
+        </div>
+      </div>
+    `;
+    chatMessages.appendChild(echoDiv);
+
+    // 2. Render the result (supports both markdown and raw HTML)
+    const resultDiv = document.createElement('div');
+    resultDiv.className = `message command-result command-result--${result.type}`;
+    const renderedContent = result.isHtml ? result.content : renderMarkdown(result.content);
+    resultDiv.innerHTML = `
+      <div class="message-wrapper">
+        <div class="command-result-content">${renderedContent}</div>
+      </div>
+    `;
+    chatMessages.appendChild(resultDiv);
+
+    // 3. Bind click handlers for interactive model buttons
+    resultDiv.querySelectorAll('.cmd-model-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const modelId = btn.dataset.modelId;
+        state.selectedModel = modelId;
+        modelSelector.value = modelId;
+        localStorage.setItem(MODEL_KEY, modelId);
+        showToast(`Model → ${getModelLabel(modelId)}`);
+        // Update button states in the list
+        resultDiv.querySelectorAll('.cmd-model-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        // Add checkmark
+        resultDiv.querySelectorAll('.cmd-model-btn').forEach(b => {
+          b.textContent = b.textContent.replace(' ✦', '');
+        });
+        btn.textContent += ' ✦';
+      });
+    });
+
+    // 4. Scroll
+    scrollToBottom();
+  }
+
+  // ─── Slash command autocomplete state ────────────────
+  let autocompleteIndex = -1;
+  let autocompleteMode = 'commands'; // 'commands' | 'suboptions'
+  let autocompleteActiveCmd = null;  // command name when showing sub-options
+
+  function renderAutocomplete(el, commands) {
+    if (commands.length === 0) { hideAutocomplete(el); return; }
+    autocompleteIndex = -1;
+    autocompleteMode = 'commands';
+    autocompleteActiveCmd = null;
+    el.innerHTML = commands.map((cmd, i) => `
+      <div class="autocomplete-item" data-index="${i}" data-command="${cmd.name}">
+        <span class="autocomplete-command">/${cmd.name}</span>
+        <span class="autocomplete-desc">${cmd.description}</span>
+        ${cmd.getSubOptions ? '<span class="autocomplete-arrow">▸</span>' : ''}
+      </div>
+    `).join('');
+    el.querySelectorAll('.autocomplete-item').forEach(item => {
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const cmdName = item.dataset.command;
+        const cmd = SLASH_COMMANDS[cmdName];
+        if (cmd && cmd.getSubOptions) {
+          // Show sub-options instead of filling input
+          renderSubOptions(el, cmd);
+        } else {
+          // No sub-options — fill input and execute
+          chatInput.value = `/${cmdName}`;
+          chatInput.focus();
+          sendMessage();
+        }
+      });
+    });
+    el.hidden = false;
+  }
+
+  function renderSubOptions(el, cmd) {
+    autocompleteIndex = -1;
+    autocompleteMode = 'suboptions';
+    autocompleteActiveCmd = cmd.name;
+    const subItems = cmd.getSubOptions();
+
+    let html = `<div class="autocomplete-sub-header">
+      <button class="autocomplete-back-btn" data-action="back">← /${cmd.name}</button>
+    </div>`;
+    html += '<div class="autocomplete-sub-list">';
+    let optionIdx = 0;
+    subItems.forEach(item => {
+      if (item.type === 'group') {
+        html += `<div class="autocomplete-subgroup">${item.label}</div>`;
+      } else {
+        html += `<div class="autocomplete-suboption${item.active ? ' active' : ''}" data-index="${optionIdx}" data-value="${item.value}">
+          ${item.label}${item.active ? ' <span class="sub-active-marker">✦</span>' : ''}
+        </div>`;
+        optionIdx++;
+      }
+    });
+    html += '</div>';
+    el.innerHTML = html;
+
+    // Back button
+    el.querySelector('.autocomplete-back-btn').addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const allCmds = Object.values(SLASH_COMMANDS);
+      renderAutocomplete(el, allCmds);
+    });
+
+    // Sub-option click handlers
+    el.querySelectorAll('.autocomplete-suboption').forEach(optEl => {
+      optEl.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const value = optEl.dataset.value;
+        // Find the matching sub-item and execute its action
+        const subItem = subItems.find(s => s.type === 'option' && s.value === value);
+        if (subItem && subItem.action) {
+          chatInput.value = '';
+          autoResize();
+          updateSendButton();
+          subItem.action();
+          hideAutocomplete(el);
+          // Render feedback in chat
+          renderCommandResult(`/${cmd.name} ${value}`, {
+            type: 'success',
+            content: getSubOptionFeedback(cmd.name, value),
+          });
+        }
+      });
+    });
+
+    el.hidden = false;
+  }
+
+  function getSubOptionFeedback(cmdName, value) {
+    if (cmdName === 'model') return `Model switched to **${getModelLabel(value)}**`;
+    if (cmdName === 'effort') return `Reasoning effort set to **${value.charAt(0).toUpperCase() + value.slice(1)}**`;
+    if (cmdName === 'thinking') return `Extended thinking **${value === 'on' ? 'enabled' : 'disabled'}**`;
+    if (cmdName === 'cost') return `Cost dashboard opened (${value})`;
+    return `${cmdName} → ${value}`;
+  }
+
+  function hideAutocomplete(el) {
+    if (el) { el.hidden = true; }
+    autocompleteIndex = -1;
+    autocompleteMode = 'commands';
+    autocompleteActiveCmd = null;
+  }
+
+  function navigateAutocomplete(el, direction) {
+    const selector = autocompleteMode === 'suboptions' ? '.autocomplete-suboption' : '.autocomplete-item';
+    const items = el.querySelectorAll(selector);
+    if (items.length === 0) return;
+    if (autocompleteIndex >= 0 && autocompleteIndex < items.length) {
+      items[autocompleteIndex].classList.remove('highlighted');
+    }
+    autocompleteIndex += direction;
+    if (autocompleteIndex < 0) autocompleteIndex = items.length - 1;
+    if (autocompleteIndex >= items.length) autocompleteIndex = 0;
+    items[autocompleteIndex].classList.add('highlighted');
+    items[autocompleteIndex].scrollIntoView({ block: 'nearest' });
+  }
+
+  function acceptAutocomplete(el) {
+    if (autocompleteMode === 'suboptions') {
+      // Accept a sub-option → simulate click
+      const items = el.querySelectorAll('.autocomplete-suboption');
+      if (autocompleteIndex >= 0 && autocompleteIndex < items.length) {
+        items[autocompleteIndex].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      }
+      return;
+    }
+    // Accept a command → show sub-options if available, otherwise fill input
+    const items = el.querySelectorAll('.autocomplete-item');
+    if (autocompleteIndex >= 0 && autocompleteIndex < items.length) {
+      const cmdName = items[autocompleteIndex].dataset.command;
+      const cmd = SLASH_COMMANDS[cmdName];
+      if (cmd && cmd.getSubOptions) {
+        renderSubOptions(el, cmd);
+      } else {
+        chatInput.value = `/${cmdName}`;
+        chatInput.focus();
+        hideAutocomplete(el);
+        sendMessage();
+      }
+    } else {
+      hideAutocomplete(el);
+    }
+  }
+
+  // ─── Thinking UI sync ────────────────────────────────
+  function applyThinkingUI() {
+    const btn = document.getElementById('thinkingBtn');
+    if (!btn) return;
+    btn.classList.toggle('active', state.thinkingEnabled);
+    btn.setAttribute('aria-pressed', String(state.thinkingEnabled));
+    const label = btn.querySelector('.thinking-label');
+    if (label) {
+      label.textContent = state.thinkingEnabled ? 'Think ON' : 'Think OFF';
+    }
+  }
+
+  // ─── Effort UI sync (module-scope for slash commands) ──
+  function applyEffortUI() {
+    document.querySelectorAll('.effort-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.effort === state.selectedEffort);
+    });
+    const label = document.querySelector('.effort-label');
+    if (label) {
+      const cap = state.selectedEffort.charAt(0).toUpperCase() + state.selectedEffort.slice(1);
+      label.textContent = cap;
+    }
+  }
+
   // ─── Send message ─────────────────────────────────
   async function sendMessage(resendMode) {
     let text = resendMode ? '' : chatInput.value.trim();
     const images = resendMode ? [] : [...pendingImages];
     const files = resendMode ? [] : [...pendingFiles];
+
+    // ── Slash Command Interception ─────────────────────────
+    if (!resendMode && text.startsWith('/')) {
+      const parsed = parseSlashCommand(text);
+      if (parsed) {
+        chatInput.value = '';
+        autoResize();
+        updateSendButton();
+        const acEl = document.getElementById('commandAutocomplete');
+        if (acEl) hideAutocomplete(acEl);
+        const result = executeSlashCommand(parsed);
+        renderCommandResult(text, result);
+        return; // early exit — no API call
+      }
+    }
+    // ── End Slash Command Interception ─────────────────────
 
     // Prepend file contents to the message text
     if (files.length > 0) {
@@ -2635,16 +3220,33 @@
       const windowSize = getContextWindowSize(model);
       const truncatedMessages = truncateConversationForContext(apiMessages, windowSize);
 
+      // Build request body — conditionally include thinking
+      const requestBody = {
+        model,
+        messages: truncatedMessages,
+        stream: true,
+        stream_options: { include_usage: true },
+        reasoning_effort: state.selectedEffort,
+      };
+      if (state.thinkingEnabled) {
+        // Opus 4.6 / Sonnet 4.6: use adaptive thinking (budget_tokens deprecated)
+        // Older models: use enabled + budget_tokens
+        const isAdaptiveModel = /claude-(opus|sonnet)-4-6/i.test(model) ||
+          /^(opus|sonnet)(-1m)?$/i.test(model);
+        if (isAdaptiveModel) {
+          requestBody.thinking = { type: 'adaptive' };
+        } else {
+          requestBody.thinking = {
+            type: 'enabled',
+            budget_tokens: state.thinkingBudget,
+          };
+        }
+      }
+
       const res = await fetch(`${getProxyUrl()}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: truncatedMessages,
-          stream: true,
-          stream_options: { include_usage: true },
-          reasoning_effort: state.selectedEffort,
-        }),
+        body: JSON.stringify(requestBody),
         signal: abortController.signal,
       });
 
@@ -3472,17 +4074,76 @@
       });
     }
 
+    // ─── Slash command autocomplete ───────────────────────
+    const acEl = document.getElementById('commandAutocomplete');
+
     chatInput.addEventListener('input', () => {
       autoResize();
       updateSendButton();
       debouncedUpdateContextBar();
+
+      // Autocomplete: activate on "/" prefix
+      if (acEl) {
+        const val = chatInput.value;
+        if (val.startsWith('/')) {
+          const hasSpace = val.includes(' ');
+          if (!hasSpace) {
+            // No space yet — show matching commands
+            const query = val.substring(1).toLowerCase();
+            const matches = Object.values(SLASH_COMMANDS).filter(cmd =>
+              cmd.name.startsWith(query)
+            );
+            renderAutocomplete(acEl, matches);
+          } else {
+            // Has space — show sub-options for the command if available
+            const cmdName = val.substring(1, val.indexOf(' ')).toLowerCase();
+            const cmd = SLASH_COMMANDS[cmdName];
+            if (cmd && cmd.getSubOptions && autocompleteMode !== 'suboptions') {
+              renderSubOptions(acEl, cmd);
+            } else if (!cmd || !cmd.getSubOptions) {
+              hideAutocomplete(acEl);
+            }
+          }
+        } else {
+          hideAutocomplete(acEl);
+        }
+      }
     });
 
     chatInput.addEventListener('keydown', (e) => {
+      // Autocomplete navigation when dropdown is visible
+      if (acEl && !acEl.hidden) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          navigateAutocomplete(acEl, e.key === 'ArrowDown' ? 1 : -1);
+          return;
+        }
+        if (e.key === 'Tab' || (e.key === 'Enter' && autocompleteIndex >= 0)) {
+          e.preventDefault();
+          acceptAutocomplete(acEl);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          if (autocompleteMode === 'suboptions') {
+            // Go back to command list
+            const allCmds = Object.values(SLASH_COMMANDS);
+            renderAutocomplete(acEl, allCmds);
+            chatInput.value = '/';
+          } else {
+            hideAutocomplete(acEl);
+          }
+          return;
+        }
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
+    });
+
+    chatInput.addEventListener('blur', () => {
+      if (acEl) setTimeout(() => hideAutocomplete(acEl), 150);
     });
 
     chatInput.addEventListener('paste', handlePaste);
@@ -3508,18 +4169,6 @@
     });
 
     // ─── Effort buttons (mirrors CLI /model effort slider) ────────────
-    function applyEffortUI() {
-      document.querySelectorAll('.effort-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.effort === state.selectedEffort);
-      });
-      // Update the effort label to show current level, like CLI's "▪▪▪ High"
-      const label = document.querySelector('.effort-label');
-      if (label) {
-        const cap = state.selectedEffort.charAt(0).toUpperCase() + state.selectedEffort.slice(1);
-        label.textContent = cap;
-      }
-    }
-
     document.querySelectorAll('.effort-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         state.selectedEffort = btn.dataset.effort;
@@ -3530,6 +4179,18 @@
 
     // Sync effort UI with restored state on load
     applyEffortUI();
+
+    // ─── Thinking toggle button ─────────────────────────
+    const thinkingBtn = document.getElementById('thinkingBtn');
+    if (thinkingBtn) {
+      thinkingBtn.addEventListener('click', () => {
+        state.thinkingEnabled = !state.thinkingEnabled;
+        localStorage.setItem(THINKING_KEY, JSON.stringify(state.thinkingEnabled));
+        applyThinkingUI();
+        showToast(`Thinking → ${state.thinkingEnabled ? 'ON' : 'OFF'}`);
+      });
+    }
+    applyThinkingUI();
 
     themeToggle.addEventListener('click', toggleTheme);
 
