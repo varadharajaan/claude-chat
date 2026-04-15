@@ -175,7 +175,7 @@ def wait_for_port(port, timeout=10, interval=0.5):
     return False
 
 
-def wait_for_port_closed(port, timeout=5, interval=0.5):
+def wait_for_port_closed(port, timeout=15, interval=0.5):
     """Wait until a port is no longer open or timeout."""
     elapsed = 0
     while elapsed < timeout:
@@ -443,9 +443,28 @@ def stop_proxy():
         elapsed = time.time() - t0
         print(f"  {C.GREEN}[proxy]{C.RESET} Stopped {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return True
+
+    # First kill didn't work — force kill current PID on port (may differ from original)
+    retry_pid = find_pid_on_port(PROXY_PORT)
+    if retry_pid:
+        print(f"  {C.YELLOW}[proxy]{C.RESET} Still alive (PID: {retry_pid}), force killing...")
+        try:
+            subprocess.run(["taskkill", "/PID", str(retry_pid), "/T", "/F"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        # Also kill any child processes on that port
+        try:
+            subprocess.run(["taskkill", "/F", "/FI", f"PID eq {retry_pid}"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    if wait_for_port_closed(PROXY_PORT, timeout=5):
+        elapsed = time.time() - t0
+        print(f"  {C.GREEN}[proxy]{C.RESET} Stopped (forced) {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
+        return True
     else:
         elapsed = time.time() - t0
-        print(f"  {C.RED}[proxy]{C.RESET} Failed to stop — try: taskkill /PID {pid} /F {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
+        print(f"  {C.RED}[proxy]{C.RESET} Failed to stop — try: taskkill /PID {retry_pid or pid} /F {C.DIM}[{fmt_elapsed(elapsed)}]{C.RESET}")
         return False
 
 
@@ -937,13 +956,32 @@ def main():
             stop_proxy()
 
     elif action == "restart":
-        # Stop first
+        # Stop if running
         if target in ("chat", "all"):
-            stop_chat()
+            if find_pid_on_port(CHAT_PORT):
+                stop_chat()
+            else:
+                print(f"  {C.DIM}[chat]{C.RESET}  Not running — skip stop")
         if target in ("proxy", "all"):
-            stop_proxy()
+            if find_pid_on_port(PROXY_PORT):
+                stop_proxy()
+            else:
+                print(f"  {C.DIM}[proxy]{C.RESET} Not running — skip stop")
+
+        # Force-kill anything still holding the ports
+        for label, port in [("proxy", PROXY_PORT), ("chat", CHAT_PORT)]:
+            if target not in (label, "all"):
+                continue
+            stubborn_pid = find_pid_on_port(port)
+            if stubborn_pid:
+                print(f"  {C.YELLOW}[{label}]{C.RESET} Port {port} still held by PID {stubborn_pid} — force killing...")
+                try:
+                    subprocess.run(["taskkill", "/PID", str(stubborn_pid), "/T", "/F"], capture_output=True, timeout=10)
+                except Exception:
+                    pass
+                time.sleep(1)
+
         print()
-        time.sleep(1)
         # Then start
         if target in ("proxy", "all"):
             start_proxy()
